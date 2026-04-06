@@ -48,7 +48,7 @@ API_BASE = "https://grsai.dakka.com.cn"
 SUBMIT_PATH = "/v1/draw/nano-banana"
 RESULT_PATH = "/v1/draw/result"
 
-DEFAULT_API_KEY = "API_KEY"
+DEFAULT_API_KEY = "你的API_KEY"
 
 DEFAULT_MODEL = "nano-banana-2"
 DEFAULT_ASPECT_RATIO = "auto"
@@ -98,6 +98,7 @@ MULTIVIEW_SET_6 = [
 
 DEFAULT_MULTI_TILE_SIZE = 1024
 DEFAULT_UV_GUIDE_TILE_SIZE = 1024
+DEFAULT_ATLAS_BG = "#242424"
 
 MULTIVIEW_ROT_PRESETS = {
     "front": [0.0, 0.0, 0.0],
@@ -291,6 +292,47 @@ def fit_pixmap_to_canvas(pixmap, width, height, bg="#000000"):
     return canvas
 
 
+def fit_pixmap_height_locked(pixmap, width, height, bg="#000000"):
+    if pixmap is None or pixmap.isNull():
+        raise RuntimeError("fit_pixmap_height_locked 输入图片无效")
+
+    src_w = pixmap.width()
+    src_h = pixmap.height()
+    if src_w <= 0 or src_h <= 0:
+        raise RuntimeError("输入图片尺寸无效")
+
+    scale = float(height) / float(src_h)
+    scaled_w = max(1, int(round(src_w * scale)))
+    scaled_h = int(height)
+
+    scaled = pixmap.scaled(
+        scaled_w,
+        scaled_h,
+        QtCore.Qt.AspectRatioMode.IgnoreAspectRatio,
+        QtCore.Qt.TransformationMode.SmoothTransformation
+    )
+
+    canvas = QtGui.QPixmap(width, height)
+    canvas.fill(QtGui.QColor(bg))
+
+    painter = QtGui.QPainter(canvas)
+    try:
+        if scaled_w > width:
+            src_x = int(round((scaled_w - width) * 0.5))
+            painter.drawPixmap(
+                QtCore.QRect(0, 0, width, height),
+                scaled,
+                QtCore.QRect(src_x, 0, width, height)
+            )
+        else:
+            dst_x = int(round((width - scaled_w) * 0.5))
+            painter.drawPixmap(dst_x, 0, scaled)
+    finally:
+        painter.end()
+
+    return canvas
+
+
 def draw_corner_label(painter, rect, text, margin=12):
     if not text:
         return
@@ -357,12 +399,37 @@ def build_multiview_atlas(tile_records, atlas_path, tile_size=DEFAULT_MULTI_TILE
             y = (idx // cols) * tile_h
 
             src = load_pixmap_safe(rec["capture_path"])
-            fitted = fit_pixmap_to_canvas(src, tile_w, tile_h, bg="#000000")
+
+            src_w = src.width()
+            src_h = src.height()
+            if src_w <= 0 or src_h <= 0:
+                raise RuntimeError("输入截图尺寸无效: {}".format(rec["capture_path"]))
+
+            scale = float(tile_h) / float(src_h)
+            scaled_w = max(1, int(round(src_w * scale)))
+            scaled_h = tile_h
+
+            fitted = fit_pixmap_height_locked(src, tile_w, tile_h, bg=DEFAULT_ATLAS_BG)
             painter.drawPixmap(x, y, fitted)
 
             tile_rect = QtCore.QRect(x, y, tile_w, tile_h)
             label_text = rec.get("slot_label") or rec.get("slot_name") or ""
             draw_corner_label(painter, tile_rect, label_text)
+
+            if scaled_w > tile_w:
+                content_rect = [0, 0, tile_w, tile_h]
+                placement_mode = "crop_x"
+                crop_left = int(round((scaled_w - tile_w) * 0.5))
+                crop_right = max(0, scaled_w - tile_w - crop_left)
+                pad_left = 0
+                pad_right = 0
+            else:
+                pad_left = int(round((tile_w - scaled_w) * 0.5))
+                pad_right = max(0, tile_w - scaled_w - pad_left)
+                content_rect = [pad_left, 0, scaled_w, tile_h]
+                placement_mode = "pad_x"
+                crop_left = 0
+                crop_right = 0
 
             manifest_tiles.append({
                 "index": idx,
@@ -375,6 +442,16 @@ def build_multiview_atlas(tile_records, atlas_path, tile_size=DEFAULT_MULTI_TILE
                 "capture_path": rec.get("capture_path"),
                 "camera_state": rec.get("camera_state"),
                 "time": rec.get("time"),
+
+                "fit_mode": "height_locked",
+                "source_size": [src_w, src_h],
+                "scaled_size": [scaled_w, scaled_h],
+                "content_rect": content_rect,
+                "placement_mode": placement_mode,
+                "pad_left": pad_left,
+                "pad_right": pad_right,
+                "crop_left": crop_left,
+                "crop_right": crop_right,
             })
     finally:
         painter.end()
@@ -391,6 +468,7 @@ def build_multiview_atlas(tile_records, atlas_path, tile_size=DEFAULT_MULTI_TILE
         "tile_height": tile_h,
         "cols": cols,
         "rows": rows,
+        "fit_mode": "height_locked",
         "tiles": manifest_tiles,
     }
     return manifest
