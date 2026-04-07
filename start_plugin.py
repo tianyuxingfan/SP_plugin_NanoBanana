@@ -48,7 +48,7 @@ API_BASE = "https://grsai.dakka.com.cn"
 SUBMIT_PATH = "/v1/draw/nano-banana"
 RESULT_PATH = "/v1/draw/result"
 
-DEFAULT_API_KEY = "你的API_KEY"
+DEFAULT_API_KEY = "填写API_KEY"
 
 DEFAULT_MODEL = "nano-banana-2"
 DEFAULT_ASPECT_RATIO = "auto"
@@ -71,6 +71,9 @@ MODE_UV_GUIDE = "UV贴图生成"
 DEFAULT_SINGLE_PROMPT = """根据当前视角参考生成贴图效果，保持主体结构与轮廓一致。
 
 材质指定："""
+
+DEFAULT_SINGLE_REF_PROMPT = """左侧是参考图，右侧是模型当前视角。
+参考左侧风格重绘右侧模型，保持右侧轮廓、结构、视角与构图不变。"""
 
 DEFAULT_MULTI_PROMPT = """根据多个标准视角参考生成统一贴图效果，保持不同视角下材质、颜色和细节一致。
 
@@ -333,6 +336,13 @@ def fit_pixmap_height_locked(pixmap, width, height, bg="#000000"):
     return canvas
 
 
+def normalize_square_height_locked(pixmap, size, bg=DEFAULT_ATLAS_BG):
+    if pixmap is None or pixmap.isNull():
+        raise RuntimeError("normalize_square_height_locked 输入图片无效")
+    side = max(1, int(size))
+    return fit_pixmap_height_locked(pixmap, side, side, bg=bg)
+
+
 def draw_corner_label(painter, rect, text, margin=12):
     if not text:
         return
@@ -388,7 +398,7 @@ def build_multiview_atlas(tile_records, atlas_path, tile_size=DEFAULT_MULTI_TILE
     atlas_h = rows * tile_h
 
     atlas = QtGui.QPixmap(atlas_w, atlas_h)
-    atlas.fill(QtGui.QColor("#000000"))
+    atlas.fill(QtGui.QColor(DEFAULT_ATLAS_BG))
 
     manifest_tiles = []
 
@@ -633,6 +643,118 @@ def build_uvguide_composite_from_pixmaps(multiview_atlas_path, uv_pixmap, output
         "panel_size": panel_size,
         "gap": gap,
         "multiview_atlas_path": multiview_atlas_path,
+    }
+
+
+def build_single_ref_composite_from_pixmaps(main_pixmap, ref_pixmap, output_path, panel_size=2048, gap=32):
+    if main_pixmap is None or main_pixmap.isNull():
+        raise RuntimeError("主视图 pixmap 无效")
+    if ref_pixmap is None or ref_pixmap.isNull():
+        raise RuntimeError("参考图 pixmap 无效")
+
+    left = normalize_square_height_locked(ref_pixmap, panel_size, bg=DEFAULT_ATLAS_BG)
+    right = normalize_square_height_locked(main_pixmap, panel_size, bg=DEFAULT_ATLAS_BG)
+
+    canvas_w = panel_size * 2 + gap
+    canvas_h = panel_size
+
+    canvas = QtGui.QPixmap(canvas_w, canvas_h)
+    canvas.fill(QtGui.QColor("#000000"))
+
+    painter = QtGui.QPainter(canvas)
+    try:
+        painter.drawPixmap(0, 0, left)
+        painter.drawPixmap(panel_size + gap, 0, right)
+
+        pen = QtGui.QPen(QtGui.QColor("#404040"))
+        pen.setWidth(2)
+        painter.setPen(pen)
+        painter.drawLine(panel_size + int(gap / 2), 0, panel_size + int(gap / 2), canvas_h)
+
+        font = painter.font()
+        font.setPointSize(18)
+        font.setBold(True)
+        painter.setFont(font)
+
+        painter.setPen(QtGui.QColor("#d0d0d0"))
+        painter.drawText(
+            QtCore.QRect(12, 8, panel_size - 24, 32),
+            QtCore.Qt.AlignmentFlag.AlignLeft,
+            "REF"
+        )
+        painter.drawText(
+            QtCore.QRect(panel_size + gap + 12, 8, panel_size - 24, 32),
+            QtCore.Qt.AlignmentFlag.AlignLeft,
+            "VIEW"
+        )
+    finally:
+        painter.end()
+
+    ok = canvas.save(output_path, "PNG")
+    if not ok:
+        raise RuntimeError("保存单视图参考拼图失败: {}".format(output_path))
+
+    return {
+        "type": "single_ref_manifest",
+        "time": now_str_readable(),
+        "composite_path": output_path,
+        "canvas_size": [canvas_w, canvas_h],
+        "ref_rect": [0, 0, panel_size, panel_size],
+        "main_rect": [panel_size + gap, 0, panel_size, panel_size],
+        "panel_size": panel_size,
+        "gap": gap,
+        "fit_mode": "height_locked_square",
+    }
+
+
+def split_single_ref_result_by_manifest(result_image_path, manifest, output_path, crop_key="main_rect"):
+    if not isinstance(manifest, dict):
+        raise RuntimeError("single_ref manifest 无效")
+
+    image = QtGui.QImage(result_image_path)
+    if image.isNull():
+        raise RuntimeError("无法读取结果图: {}".format(result_image_path))
+
+    canvas_size = manifest.get("canvas_size", [])
+    crop_rect = manifest.get(crop_key, [])
+
+    if len(canvas_size) != 2 or len(crop_rect) != 4:
+        raise RuntimeError("single_ref manifest 缺少 canvas_size / {}".format(crop_key))
+
+    src_w, src_h = int(canvas_size[0]), int(canvas_size[1])
+    rx, ry, rw, rh = [int(v) for v in crop_rect]
+
+    dst_w = image.width()
+    dst_h = image.height()
+
+    if src_w <= 0 or src_h <= 0 or dst_w <= 0 or dst_h <= 0:
+        raise RuntimeError("结果尺寸无效")
+
+    scale_x = float(dst_w) / float(src_w)
+    scale_y = float(dst_h) / float(src_h)
+
+    x0 = int(round(rx * scale_x))
+    y0 = int(round(ry * scale_y))
+    x1 = int(round((rx + rw) * scale_x))
+    y1 = int(round((ry + rh) * scale_y))
+
+    x0 = max(0, min(x0, max(dst_w - 1, 0)))
+    y0 = max(0, min(y0, max(dst_h - 1, 0)))
+    x1 = max(x0 + 1, min(x1, dst_w))
+    y1 = max(y0 + 1, min(y1, dst_h))
+
+    sub = image.copy(x0, y0, x1 - x0, y1 - y0)
+    if sub.isNull():
+        raise RuntimeError("裁切单视图参考结果失败")
+
+    ok = sub.save(output_path, "PNG")
+    if not ok:
+        raise RuntimeError("保存单视图参考裁切图失败: {}".format(output_path))
+
+    return {
+        "result_path": output_path,
+        "crop_scaled_rect": [x0, y0, x1 - x0, y1 - y0],
+        "source_result_path": result_image_path,
     }
 
 
@@ -1097,6 +1219,7 @@ class AIGenPanel(QtWidgets.QWidget):
         self.pending_job_context = None
         self.pending_apply_payload = None
         self._suppress_tab_clear = False
+        self.single_ref_image_path = ""
 
         self.gen_queue = py_queue.Queue()
         self.gen_thread = None
@@ -1195,22 +1318,36 @@ class AIGenPanel(QtWidgets.QWidget):
 
         self.mode_combo = QtWidgets.QComboBox()
         self.mode_combo.addItems([MODE_SINGLE, MODE_MULTI, MODE_UV_GUIDE])
+        self.mode_combo.setMinimumWidth(108)
+        self.mode_combo.setMaximumWidth(122)
 
-        self.multi_set_label = QtWidgets.QLabel("视角集")
+        self.multi_set_label = QtWidgets.QLabel("视角")
         self.multi_set_combo = QtWidgets.QComboBox()
         self.multi_set_combo.addItems(["4视角", "6视角"])
         self.multi_set_combo.setCurrentText("6视角")
+        self.multi_set_combo.setFixedWidth(64)
 
-        workflow_widget = QtWidgets.QWidget()
-        workflow_layout = QtWidgets.QHBoxLayout(workflow_widget)
-        workflow_layout.setContentsMargins(0, 0, 0, 0)
-        workflow_layout.setSpacing(4)
-        workflow_layout.addWidget(self.mode_combo, 0)
-        workflow_layout.addStretch(1)
-        workflow_layout.addWidget(self.multi_set_label, 0)
-        workflow_layout.addWidget(self.multi_set_combo, 0)
+        self.single_ref_check = QtWidgets.QCheckBox("参考图")
+        self.single_ref_check.setStyleSheet("margin-left:4px;")
 
-        form.addRow("Workflow", workflow_widget)
+        self.single_ref_pick_btn = QtWidgets.QPushButton("选择文件")
+        self.single_ref_pick_btn.setFixedWidth(72)
+        self.single_ref_pick_btn.setVisible(False)
+
+        self.mode_row_widget = QtWidgets.QWidget()
+        mode_row_layout = QtWidgets.QHBoxLayout(self.mode_row_widget)
+        mode_row_layout.setContentsMargins(0, 0, 0, 0)
+        mode_row_layout.setSpacing(4)
+
+        mode_row_layout.addWidget(self.mode_combo, 0)
+        mode_row_layout.addWidget(self.multi_set_label, 0)
+        mode_row_layout.addWidget(self.multi_set_combo, 0)
+        mode_row_layout.addWidget(self.single_ref_check, 0)
+        mode_row_layout.addWidget(self.single_ref_pick_btn, 0)
+        mode_row_layout.addStretch(1)
+
+        form.addRow(self.mode_row_widget)
+
         layout.addLayout(form)
 
         btn_layout = QtWidgets.QHBoxLayout()
@@ -1322,6 +1459,9 @@ class AIGenPanel(QtWidgets.QWidget):
         self.mode_combo.currentTextChanged.connect(self.on_mode_changed)
         self.preview_tabs.currentChanged.connect(self.on_preview_tab_changed)
 
+        self.single_ref_check.toggled.connect(self.on_single_ref_toggled)
+        self.single_ref_pick_btn.clicked.connect(self.on_single_ref_pick_btn_clicked)
+
         self.on_mode_changed(self.mode_combo.currentText())
 
     def _create_thumb_list(self):
@@ -1358,6 +1498,73 @@ class AIGenPanel(QtWidgets.QWidget):
             }
         """)
         return w
+
+    def update_single_ref_ui(self):
+        mode = self.mode_combo.currentText()
+        is_single = (mode == MODE_SINGLE)
+        is_multi = (mode == MODE_MULTI)
+        checked = self.single_ref_check.isChecked()
+
+        self.multi_set_label.setVisible(is_multi)
+        self.multi_set_combo.setVisible(is_multi)
+
+        self.single_ref_check.setVisible(is_single)
+        self.single_ref_pick_btn.setVisible(is_single and checked)
+
+        self.refresh_single_ref_button_text()
+
+    def on_single_ref_toggled(self, checked):
+        if not checked:
+            self.single_ref_image_path = ""
+
+        self.update_single_ref_ui()
+
+        if self.mode_combo.currentText() == MODE_SINGLE:
+            if checked:
+                self.status_label.setText("单视角参考图模式")
+                self.prompt_edit.setPlainText(DEFAULT_SINGLE_REF_PROMPT)
+            else:
+                self.status_label.setText("单视角模式")
+                self.prompt_edit.setPlainText(DEFAULT_SINGLE_PROMPT)
+
+    def on_single_ref_pick_btn_clicked(self):
+        if self.single_ref_image_path and os.path.exists(self.single_ref_image_path):
+            self.on_clear_single_ref_image()
+        else:
+            self.on_pick_single_ref_image()
+
+    def on_pick_single_ref_image(self):
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "选择参考图",
+            os.path.expanduser("~/Pictures"),
+            "Images (*.png *.jpg *.jpeg *.bmp *.webp)"
+        )
+        if not file_path:
+            return
+
+        self.single_ref_image_path = file_path
+        self.refresh_single_ref_button_text()
+        self.log("已选择参考图: {}".format(file_path))
+
+        if self.mode_combo.currentText() == MODE_SINGLE and self.single_ref_check.isChecked():
+            self.prompt_edit.setPlainText(DEFAULT_SINGLE_REF_PROMPT)
+
+    def on_clear_single_ref_image(self):
+        self.single_ref_image_path = ""
+        self.refresh_single_ref_button_text()
+        self.log("已清空参考图")
+
+        if self.mode_combo.currentText() == MODE_SINGLE and self.single_ref_check.isChecked():
+            self.prompt_edit.setPlainText(DEFAULT_SINGLE_REF_PROMPT)
+
+    def refresh_single_ref_button_text(self):
+        if self.single_ref_image_path and os.path.exists(self.single_ref_image_path):
+            self.single_ref_pick_btn.setText("清空")
+            self.single_ref_pick_btn.setToolTip(self.single_ref_image_path)
+        else:
+            self.single_ref_pick_btn.setText("选择文件")
+            self.single_ref_pick_btn.setToolTip("选择参考图")
 
     def log(self, text):
         self.log_edit.appendPlainText(text)
@@ -2063,6 +2270,10 @@ class AIGenPanel(QtWidgets.QWidget):
             lines.append("类型: UV贴图结果")
         elif record.get("is_multiview_atlas"):
             lines.append("类型: 多视角拼图")
+        elif record.get("is_single_ref_input"):
+            lines.append("类型: 单视图参考输入")
+        elif record.get("is_single_ref_result"):
+            lines.append("类型: 单视图参考结果")
         elif record.get("type") == "result" and (record.get("mode") == MODE_MULTI or record.get("is_multiview_result")):
             lines.append("类型: 多视角结果")
         elif record.get("type") == "result":
@@ -2101,7 +2312,11 @@ class AIGenPanel(QtWidgets.QWidget):
             record,
             image_path,
             lazy_icon=lazy_icon,
-            lazy_text="UV" if record.get("is_uvguide_input") else ("MV" if record.get("is_multiview_atlas") else "CP")
+            lazy_text=(
+                "UV" if record.get("is_uvguide_input")
+                else ("MV" if record.get("is_multiview_atlas")
+                      else ("RF" if record.get("is_single_ref_input") else "CP"))
+            )
         )
 
         if prepend:
@@ -2149,11 +2364,19 @@ class AIGenPanel(QtWidgets.QWidget):
             parts.append("类型: UV自动导出输入")
         elif record.get("is_uv_result"):
             parts.append("类型: UV贴图结果")
+        elif record.get("is_single_ref_input"):
+            parts.append("类型: 单视图参考输入")
+        elif record.get("is_single_ref_result"):
+            parts.append("类型: 单视图参考结果")
         else:
             parts.append("类型: {}".format("结果" if record.get("type") == "result" else "截图"))
 
         if record.get("is_multiview_atlas"):
             parts.append("说明: 多视角拼图")
+        elif record.get("is_single_ref_input"):
+            parts.append("说明: 左参考图 + 右主视图 输入")
+        elif record.get("is_single_ref_result"):
+            parts.append("说明: 单视图参考图结果（已裁右侧主图区）")
         elif record.get("type") == "result" and (record.get("mode") == MODE_MULTI or record.get("is_multiview_result")):
             parts.append("说明: 多视角结果")
         elif record.get("mode") == MODE_UV_GUIDE or record.get("is_uvguide_input") or record.get("is_uv_result"):
@@ -2491,11 +2714,10 @@ class AIGenPanel(QtWidgets.QWidget):
             self.log("加载缩略图失败: {}".format(e))
 
     def on_mode_changed(self, text):
-        is_multi = (text == MODE_MULTI)
         is_uvguide = (text == MODE_UV_GUIDE)
+        is_multi = (text == MODE_MULTI)
 
-        self.multi_set_label.setVisible(is_multi)
-        self.multi_set_combo.setVisible(is_multi)
+        self.update_single_ref_ui()
 
         if is_uvguide:
             self.status_label.setText("UV导出模式")
@@ -2504,8 +2726,12 @@ class AIGenPanel(QtWidgets.QWidget):
             self.status_label.setText("多视角模式")
             self.prompt_edit.setPlainText(DEFAULT_MULTI_PROMPT)
         else:
-            self.status_label.setText("单视角模式")
-            self.prompt_edit.setPlainText(DEFAULT_SINGLE_PROMPT)
+            if self.single_ref_check.isChecked():
+                self.status_label.setText("单视角参考图模式")
+                self.prompt_edit.setPlainText(DEFAULT_SINGLE_REF_PROMPT)
+            else:
+                self.status_label.setText("单视角模式")
+                self.prompt_edit.setPlainText(DEFAULT_SINGLE_PROMPT)
 
     def current_multiview_defs(self):
         return MULTIVIEW_SET_4 if self.multi_set_combo.currentText() == "4视角" else MULTIVIEW_SET_6
@@ -2782,6 +3008,61 @@ class AIGenPanel(QtWidgets.QWidget):
                 except Exception:
                     pass
 
+    def capture_single_ref_and_build_composite(self):
+        if not substance_painter.project.is_open():
+            raise RuntimeError("请先打开一个 Painter 工程")
+
+        if not self.single_ref_image_path or not os.path.exists(self.single_ref_image_path):
+            raise RuntimeError("请先选择参考图")
+
+        output_dir = self.current_output_dir(create=True)
+        main_pixmap = self.capture_current_view()
+        camera_state = self.get_camera_state_safe()
+
+        if not camera_state:
+            raise RuntimeError("当前单视图缺少 camera_state")
+
+        ref_pixmap = load_pixmap_safe(self.single_ref_image_path)
+
+        stamp = unique_stamp()
+        tmp_composite_path = os.path.join(output_dir, "single_ref_input_{}.png".format(stamp))
+
+        try:
+            manifest = build_single_ref_composite_from_pixmaps(
+                main_pixmap=main_pixmap,
+                ref_pixmap=ref_pixmap,
+                output_path=tmp_composite_path,
+                panel_size=DEFAULT_UV_GUIDE_TILE_SIZE * 2,
+                gap=32
+            )
+
+            composite_pixmap = load_pixmap_safe(tmp_composite_path)
+            record = self.save_capture_record(
+                pixmap=composite_pixmap,
+                output_dir=output_dir,
+                prompt=self.prompt_edit.toPlainText().strip(),
+                model=self.model_combo.currentText().strip(),
+                aspect_ratio=self.aspect_combo.currentText().strip(),
+                image_size=self.size_combo.currentText().strip(),
+                camera_state=camera_state,
+                extra={
+                    "mode": MODE_SINGLE,
+                    "is_single_ref_input": True,
+                    "single_ref_manifest": manifest,
+                    "reference_image_path": self.single_ref_image_path,
+                }
+            )
+
+            write_json(record["meta_path"], record)
+
+            self.add_capture_item(record, select=True, prepend=True, lazy_icon=False)
+            self.switch_preview_tab(self.capture_page, keep_selection=True)
+            self.status_label.setText("单视图参考拼图完成")
+            self.log("单视图参考输入图已创建: {}".format(record["capture_path"]))
+            return record
+        finally:
+            safe_remove(tmp_composite_path)
+
     def on_capture_clicked(self):
         try:
             mode = self.mode_combo.currentText()
@@ -2794,8 +3075,17 @@ class AIGenPanel(QtWidgets.QWidget):
                 self.capture_uvguide_and_build_composite()
                 return
 
+            if mode == MODE_SINGLE and self.single_ref_check.isChecked():
+                self.capture_single_ref_and_build_composite()
+                return
+
             output_dir = self.current_output_dir(create=True)
             pixmap = self.capture_current_view()
+            pixmap = normalize_square_height_locked(
+                pixmap,
+                DEFAULT_MULTI_TILE_SIZE,
+                bg=DEFAULT_ATLAS_BG
+            )
             camera_state = self.get_camera_state_safe()
 
             record = self.save_capture_record(
@@ -2832,7 +3122,16 @@ class AIGenPanel(QtWidgets.QWidget):
     def refresh_client_settings(self):
         self.client.api_key = (DEFAULT_API_KEY or "").strip()
 
-        if self.client.api_key in ("API_KEY", "YOUR_API_KEY", "None", "null"):
+        invalid_values = {
+            "",
+            "API_KEY",
+            "YOUR_API_KEY",
+            "填写API_KEY",
+            "None",
+            "null",
+        }
+
+        if self.client.api_key in invalid_values:
             self.client.api_key = ""
 
     def clear_generate_queue(self):
@@ -2849,6 +3148,8 @@ class AIGenPanel(QtWidgets.QWidget):
         self.open_dir_btn.setEnabled(not busy)
         self.mode_combo.setEnabled(not busy)
         self.multi_set_combo.setEnabled(not busy)
+        self.single_ref_check.setEnabled(not busy)
+        self.single_ref_pick_btn.setEnabled(not busy)
 
         if busy:
             self.apply_btn.setEnabled(False)
@@ -2934,6 +3235,10 @@ class AIGenPanel(QtWidgets.QWidget):
                     record["is_multiview_result"] = True
                 else:
                     record["mode"] = MODE_SINGLE
+                    if ctx.get("single_ref"):
+                        record["is_single_ref_result"] = True
+                        record["single_ref_manifest"] = ctx.get("single_ref_manifest")
+                        record["reference_image_path"] = ctx.get("reference_image_path", "")
 
                 write_json(meta_path, record)
 
@@ -2998,7 +3303,7 @@ class AIGenPanel(QtWidgets.QWidget):
 
             if not self.client.api_key:
                 self.preview_tabs.setCurrentWidget(self.log_page)
-                self.set_status("请先填写 API Key")
+                self.set_status("请先填写 API Key", write_log=True)
                 return
 
             prompt = self.prompt_edit.toPlainText().strip()
@@ -3028,6 +3333,31 @@ class AIGenPanel(QtWidgets.QWidget):
                 self.start_background_generate(
                     capture_path=capture_path,
                     camera_state=None,
+                    ctx=ctx
+                )
+                return
+
+            is_single_ref_capture = bool(selected_record.get("is_single_ref_input"))
+            if is_single_ref_capture:
+                manifest = selected_record.get("single_ref_manifest")
+                if not manifest:
+                    raise RuntimeError("single_ref manifest 不存在")
+
+                camera_state = selected_record.get("camera_state")
+                if not camera_state:
+                    raise RuntimeError("single_ref 输入缺少 camera_state")
+
+                self.log("检测到当前选中的是单视图参考拼图，按单视图参考模式生成")
+
+                ctx = {
+                    "mode": MODE_SINGLE,
+                    "single_ref": True,
+                    "single_ref_manifest": manifest,
+                    "reference_image_path": selected_record.get("reference_image_path", "")
+                }
+                self.start_background_generate(
+                    capture_path=capture_path,
+                    camera_state=camera_state,
                     ctx=ctx
                 )
                 return
@@ -3106,6 +3436,26 @@ class AIGenPanel(QtWidgets.QWidget):
                 result_path = record["result_path"]
             except Exception as e:
                 self.log("UV 结果裁切失败，保留整图结果: {}".format(e))
+
+        if record.get("is_single_ref_result") and record.get("single_ref_manifest"):
+            try:
+                full_result_path = result_path
+                main_result_path = os.path.splitext(full_result_path)[0] + "_main.png"
+
+                crop_info = split_single_ref_result_by_manifest(
+                    result_image_path=full_result_path,
+                    manifest=record.get("single_ref_manifest"),
+                    output_path=main_result_path,
+                    crop_key="main_rect"
+                )
+
+                record["composite_result_path"] = full_result_path
+                record["result_path"] = crop_info["result_path"]
+                self.last_result_path = record["result_path"]
+                write_json(record["meta_path"], record)
+                result_path = record["result_path"]
+            except Exception as e:
+                self.log("单视图参考结果裁切失败，保留整图结果: {}".format(e))
 
         item = self.add_result_item(record, select=False, prepend=True, lazy_icon=False)
 
