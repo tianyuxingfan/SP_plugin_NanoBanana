@@ -48,14 +48,49 @@ API_BASE = "https://grsai.dakka.com.cn"
 SUBMIT_PATH = "/v1/draw/nano-banana"
 RESULT_PATH = "/v1/draw/result"
 
-DEFAULT_API_KEY = "填写API_KEY"
-
 DEFAULT_MODEL = "nano-banana-2"
 DEFAULT_ASPECT_RATIO = "auto"
 DEFAULT_IMAGE_SIZE = "1K"
 
 DEFAULT_POLL_INTERVAL = 1.5
 DEFAULT_POLL_TIMEOUT = 300
+
+DEFAULT_OUTPUT_DIR = os.path.expanduser("~/Pictures/sp_ai_outputs")
+
+PROVIDER_GRSAI = "grsai"
+PROVIDER_CUSTOM = "custom_compatible"
+
+PROVIDER_PRESETS = {
+    PROVIDER_GRSAI: {
+        "label": "GRSAI",
+        "api_base": "https://grsai.dakka.com.cn",
+        "submit_path": "/v1/draw/nano-banana",
+        "result_path": "/v1/draw/result",
+        "auth_mode": "bearer",
+    },
+    PROVIDER_CUSTOM: {
+        "label": "自定义兼容平台",
+        "api_base": "",
+        "submit_path": "/v1/draw/nano-banana",
+        "result_path": "/v1/draw/result",
+        "auth_mode": "bearer",
+    },
+}
+
+DEFAULT_SETTINGS = {
+    "provider": PROVIDER_GRSAI,
+    "api_base": API_BASE,
+    "api_key": "",
+    "auth_mode": "bearer",
+    "submit_path": SUBMIT_PATH,
+    "result_path": RESULT_PATH,
+    "default_model": DEFAULT_MODEL,
+    "default_image_size": DEFAULT_IMAGE_SIZE,
+    "poll_interval": DEFAULT_POLL_INTERVAL,
+    "poll_timeout": DEFAULT_POLL_TIMEOUT,
+    "use_data_url_prefix": False,
+    "output_dir": DEFAULT_OUTPUT_DIR,
+}
 
 PLUGIN_TITLE = "AI View To Paint"
 PANEL_OBJECT_NAME = "ai_view_to_paint_panel_v40"
@@ -159,6 +194,66 @@ def write_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     return path
+
+
+def normalize_api_path(path, default=""):
+    text = str(path or default or "").strip()
+    if not text:
+        return ""
+    if not text.startswith("/"):
+        text = "/" + text
+    return text
+
+
+def plugin_settings_dir():
+    return os.path.dirname(os.path.abspath(__file__))
+
+def plugin_settings_path():
+    return os.path.join(plugin_settings_dir(), "start_plugin_settings.json")
+
+def merge_plugin_settings(data=None):
+    settings = dict(DEFAULT_SETTINGS)
+    if isinstance(data, dict):
+        settings.update(data)
+
+    provider = str(settings.get("provider", PROVIDER_GRSAI) or PROVIDER_GRSAI).strip()
+    if provider not in PROVIDER_PRESETS:
+        provider = PROVIDER_GRSAI
+    settings["provider"] = provider
+
+    preset = PROVIDER_PRESETS.get(provider, {})
+
+    settings["api_base"] = str(settings.get("api_base", preset.get("api_base", "")) or "").strip().rstrip("/")
+    settings["api_key"] = str(settings.get("api_key", "") or "").strip()
+    settings["auth_mode"] = str(settings.get("auth_mode", preset.get("auth_mode", "bearer")) or "bearer").strip().lower()
+    settings["submit_path"] = normalize_api_path(settings.get("submit_path"), preset.get("submit_path", SUBMIT_PATH))
+    settings["result_path"] = normalize_api_path(settings.get("result_path"), preset.get("result_path", RESULT_PATH))
+    settings["default_model"] = str(settings.get("default_model", DEFAULT_MODEL) or DEFAULT_MODEL).strip()
+    settings["default_image_size"] = str(settings.get("default_image_size", DEFAULT_IMAGE_SIZE) or DEFAULT_IMAGE_SIZE).strip()
+    settings["output_dir"] = str(settings.get("output_dir", DEFAULT_OUTPUT_DIR) or DEFAULT_OUTPUT_DIR).strip()
+
+    try:
+        settings["poll_interval"] = max(0.2, float(settings.get("poll_interval", DEFAULT_POLL_INTERVAL)))
+    except Exception:
+        settings["poll_interval"] = DEFAULT_POLL_INTERVAL
+
+    try:
+        settings["poll_timeout"] = max(10, int(float(settings.get("poll_timeout", DEFAULT_POLL_TIMEOUT))))
+    except Exception:
+        settings["poll_timeout"] = DEFAULT_POLL_TIMEOUT
+
+    settings["use_data_url_prefix"] = bool(settings.get("use_data_url_prefix", False))
+    return settings
+
+
+def load_plugin_settings():
+    return merge_plugin_settings(read_json(plugin_settings_path(), default={}))
+
+
+def save_plugin_settings(data):
+    settings = merge_plugin_settings(data)
+    write_json(plugin_settings_path(), settings)
+    return settings
 
 
 def safe_remove(path):
@@ -819,6 +914,7 @@ class NanoBananaClient(object):
         poll_interval=DEFAULT_POLL_INTERVAL,
         poll_timeout=DEFAULT_POLL_TIMEOUT,
         use_data_url_prefix=False,
+        auth_mode="bearer",
     ):
         self.api_base = api_base.rstrip("/")
         self.api_key = api_key
@@ -827,12 +923,22 @@ class NanoBananaClient(object):
         self.poll_interval = poll_interval
         self.poll_timeout = poll_timeout
         self.use_data_url_prefix = use_data_url_prefix
+        self.auth_mode = auth_mode
 
     def _headers(self):
-        return {
-            "Content-Type": "application/json",
-            "Authorization": "Bearer {}".format(self.api_key)
+        headers = {
+            "Content-Type": "application/json"
         }
+
+        api_key = (self.api_key or "").strip()
+        if api_key:
+            auth_mode = (self.auth_mode or "bearer").strip().lower()
+            if auth_mode == "raw":
+                headers["Authorization"] = api_key
+            else:
+                headers["Authorization"] = "Bearer {}".format(api_key)
+
+        return headers
 
     def image_file_to_base64(self, image_path):
         b64 = base64.b64encode(read_binary(image_path)).decode("utf-8")
@@ -1005,6 +1111,25 @@ class NanoBananaClient(object):
             progress_cb("结果已完成，正在下载图片...")
 
         return self.download_image(image_url, cancel_cb=cancel_cb)
+
+
+def build_image_client(settings_data):
+    s = merge_plugin_settings(settings_data)
+    provider = s.get("provider", PROVIDER_GRSAI)
+
+    if provider in (PROVIDER_GRSAI, PROVIDER_CUSTOM):
+        return NanoBananaClient(
+            api_base=s["api_base"],
+            api_key=s["api_key"],
+            submit_path=s["submit_path"],
+            result_path=s["result_path"],
+            poll_interval=s["poll_interval"],
+            poll_timeout=s["poll_timeout"],
+            use_data_url_prefix=s["use_data_url_prefix"],
+            auth_mode=s["auth_mode"],
+        )
+
+    raise RuntimeError("不支持的平台类型: {}".format(provider))
 
 
 class PreviewImageLabel(QtWidgets.QLabel):
@@ -1199,6 +1324,133 @@ class ThumbListWidget(QtWidgets.QListWidget):
         self._drag_exec(drag)
 
 
+class SettingsDialog(QtWidgets.QDialog):
+    def __init__(self, settings_data=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("设置")
+        self.resize(520, 320)
+
+        self.settings_data = merge_plugin_settings(settings_data)
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        tip = QtWidgets.QLabel("配置API接口。")
+        tip.setStyleSheet("color:#cfcfcf;")
+        root.addWidget(tip)
+
+        self.form = QtWidgets.QFormLayout()
+        self.form.setHorizontalSpacing(8)
+        self.form.setVerticalSpacing(8)
+        root.addLayout(self.form)
+
+        self.provider_combo = QtWidgets.QComboBox()
+        self.provider_combo.addItem("GRSAI", PROVIDER_GRSAI)
+        self.provider_combo.addItem("自定义平台", PROVIDER_CUSTOM)
+        idx = self.provider_combo.findData(self.settings_data.get("provider", PROVIDER_GRSAI))
+        if idx >= 0:
+            self.provider_combo.setCurrentIndex(idx)
+        self.form.addRow("平台类型", self.provider_combo)
+
+        self.api_base_edit = QtWidgets.QLineEdit(self.settings_data.get("api_base", ""))
+        self.form.addRow("API Base", self.api_base_edit)
+
+        self.api_key_edit = QtWidgets.QLineEdit(self.settings_data.get("api_key", ""))
+        self.api_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.form.addRow("API Key", self.api_key_edit)
+
+        self.auth_mode_combo = QtWidgets.QComboBox()
+        self.auth_mode_combo.addItem("Bearer", "bearer")
+        self.auth_mode_combo.addItem("Raw Key", "raw")
+        idx = self.auth_mode_combo.findData(self.settings_data.get("auth_mode", "bearer"))
+        if idx >= 0:
+            self.auth_mode_combo.setCurrentIndex(idx)
+        self.form.addRow("鉴权方式", self.auth_mode_combo)
+
+        self.model_edit = QtWidgets.QLineEdit(self.settings_data.get("default_model", DEFAULT_MODEL))
+        self.form.addRow("默认模型", self.model_edit)
+
+        self.output_dir_edit = QtWidgets.QLineEdit(self.settings_data.get("output_dir", DEFAULT_OUTPUT_DIR))
+        self.output_dir_btn = QtWidgets.QPushButton("选择目录")
+        self.output_dir_btn.setFixedWidth(90)
+        self.output_dir_btn.clicked.connect(self.on_pick_output_dir)
+
+        output_row = QtWidgets.QWidget()
+        output_layout = QtWidgets.QHBoxLayout(output_row)
+        output_layout.setContentsMargins(0, 0, 0, 0)
+        output_layout.setSpacing(6)
+        output_layout.addWidget(self.output_dir_edit, 1)
+        output_layout.addWidget(self.output_dir_btn, 0)
+        self.form.addRow("输出目录", output_row)
+
+        self.submit_path_edit = QtWidgets.QLineEdit(self.settings_data.get("submit_path", SUBMIT_PATH))
+        self.result_path_edit = QtWidgets.QLineEdit(self.settings_data.get("result_path", RESULT_PATH))
+        self.form.addRow("提交路径", self.submit_path_edit)
+        self.form.addRow("结果路径", self.result_path_edit)
+
+        btn_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok |
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        root.addWidget(btn_box)
+
+        self.provider_combo.currentIndexChanged.connect(self.on_provider_changed)
+        self.on_provider_changed()
+
+    def on_provider_changed(self):
+        provider = self.provider_combo.currentData()
+        preset = PROVIDER_PRESETS.get(provider, {})
+        is_custom = (provider == PROVIDER_CUSTOM)
+
+        submit_label = self.form.labelForField(self.submit_path_edit)
+        result_label = self.form.labelForField(self.result_path_edit)
+
+        self.submit_path_edit.setVisible(is_custom)
+        self.result_path_edit.setVisible(is_custom)
+
+        if submit_label is not None:
+            submit_label.setVisible(is_custom)
+        if result_label is not None:
+            result_label.setVisible(is_custom)
+
+        if provider == PROVIDER_GRSAI:
+            if not self.api_base_edit.text().strip():
+                self.api_base_edit.setText(preset.get("api_base", ""))
+            self.submit_path_edit.setText(preset.get("submit_path", SUBMIT_PATH))
+            self.result_path_edit.setText(preset.get("result_path", RESULT_PATH))
+
+            idx = self.auth_mode_combo.findData(preset.get("auth_mode", "bearer"))
+            if idx >= 0:
+                self.auth_mode_combo.setCurrentIndex(idx)
+
+    def on_pick_output_dir(self):
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "选择输出目录",
+            self.output_dir_edit.text().strip() or DEFAULT_OUTPUT_DIR
+        )
+        if path:
+            self.output_dir_edit.setText(path)
+
+    def get_settings(self):
+        provider = self.provider_combo.currentData()
+        preset = PROVIDER_PRESETS.get(provider, {})
+
+        return merge_plugin_settings({
+            "provider": provider,
+            "api_base": self.api_base_edit.text().strip(),
+            "api_key": self.api_key_edit.text().strip(),
+            "auth_mode": self.auth_mode_combo.currentData(),
+            "submit_path": self.submit_path_edit.text().strip() if provider == PROVIDER_CUSTOM else preset.get("submit_path", SUBMIT_PATH),
+            "result_path": self.result_path_edit.text().strip() if provider == PROVIDER_CUSTOM else preset.get("result_path", RESULT_PATH),
+            "default_model": self.model_edit.text().strip(),
+            "output_dir": self.output_dir_edit.text().strip(),
+        })
+
+
 class AIGenPanel(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1206,13 +1458,8 @@ class AIGenPanel(QtWidgets.QWidget):
         self.setWindowTitle(PLUGIN_TITLE)
         self.setObjectName(PANEL_OBJECT_NAME)
 
-        self.client = NanoBananaClient(
-            api_base=API_BASE,
-            api_key=DEFAULT_API_KEY,
-            poll_interval=DEFAULT_POLL_INTERVAL,
-            poll_timeout=DEFAULT_POLL_TIMEOUT,
-            use_data_url_prefix=False
-        )
+        self.settings_data = load_plugin_settings()
+        self.client = self.build_client_from_settings(self.settings_data)
 
         self.last_result_path = None
         self.current_preview_record = None
@@ -1233,6 +1480,7 @@ class AIGenPanel(QtWidgets.QWidget):
         self.resize(460, 860)
 
         self._build_ui()
+        self.apply_settings_to_ui()
 
         self.gen_poll_timer = QtCore.QTimer(self)
         self.gen_poll_timer.setInterval(150)
@@ -1241,15 +1489,71 @@ class AIGenPanel(QtWidgets.QWidget):
         self.clear_preview()
         self.reload_galleries(log_message=False)
 
+    def build_client_from_settings(self, settings_data):
+        return build_image_client(settings_data)
+
+    def apply_settings_to_ui(self):
+        self.settings_data = merge_plugin_settings(self.settings_data)
+
+        output_dir = self.settings_data.get("output_dir", DEFAULT_OUTPUT_DIR)
+        self.output_dir_edit.setText(output_dir)
+
+        model = self.settings_data.get("default_model", DEFAULT_MODEL)
+        if self.model_combo.findText(model) < 0:
+            self.model_combo.addItem(model)
+        self.model_combo.setCurrentText(model)
+
+        image_size = self.settings_data.get("default_image_size", DEFAULT_IMAGE_SIZE)
+        if self.size_combo.findText(image_size) < 0:
+            self.size_combo.addItem(image_size)
+        self.size_combo.setCurrentText(image_size)
+
+    def persist_output_dir_setting(self):
+        self.settings_data = merge_plugin_settings(dict(self.settings_data, **{
+            "output_dir": self.output_dir_edit.text().strip() or DEFAULT_OUTPUT_DIR
+        }))
+        save_plugin_settings(self.settings_data)
+
+    def on_settings_clicked(self):
+        old_output_dir = normalize_path_str(self.output_dir_edit.text().strip())
+
+        current_settings = dict(self.settings_data)
+        current_settings["output_dir"] = self.output_dir_edit.text().strip() or current_settings.get("output_dir",
+                                                                                                     DEFAULT_OUTPUT_DIR)
+        current_settings["default_model"] = self.model_combo.currentText().strip() or current_settings.get(
+            "default_model", DEFAULT_MODEL)
+
+        dlg = SettingsDialog(current_settings, self)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+
+        self.settings_data = save_plugin_settings(dlg.get_settings())
+        self.apply_settings_to_ui()
+        self.refresh_client_settings()
+
+        new_output_dir = normalize_path_str(self.output_dir_edit.text().strip())
+        if old_output_dir != new_output_dir:
+            self.clear_preview()
+            self.reload_galleries(log_message=False)
+
+        self.log("平台设置已保存: provider={} api_base={}".format(
+            self.settings_data.get("provider", ""),
+            self.settings_data.get("api_base", "")
+        ))
+        self.status_label.setText("设置已保存")
+
     def _build_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
+        layout.setSpacing(6)
 
         form = QtWidgets.QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)
         form.setHorizontalSpacing(6)
-        form.setVerticalSpacing(4)
+        form.setVerticalSpacing(6)
+        form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+        form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
 
         self.model_combo = QtWidgets.QComboBox()
         self.model_combo.addItems([
@@ -1265,30 +1569,26 @@ class AIGenPanel(QtWidgets.QWidget):
             "nano-banana-pro-4k-vip",
         ])
         self.model_combo.setCurrentText(DEFAULT_MODEL)
-        self.model_combo.setMinimumWidth(120)
-        self.model_combo.setMaximumWidth(160)
+        self.model_combo.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed
+        )
 
         self.size_combo = QtWidgets.QComboBox()
         self.size_combo.addItems(["1K", "2K", "4K"])
         self.size_combo.setCurrentText(DEFAULT_IMAGE_SIZE)
-        self.size_combo.setFixedWidth(58)
-
-        self.aspect_combo = QtWidgets.QComboBox()
-        self.aspect_combo.addItems([
-            "auto", "1:1", "16:9", "9:16", "4:3", "3:4",
-            "3:2", "2:3", "5:4", "4:5", "21:9",
-            "1:4", "4:1", "1:8", "8:1"
-        ])
-        self.aspect_combo.setCurrentText(DEFAULT_ASPECT_RATIO)
-        self.aspect_combo.setFixedWidth(62)
+        self.size_combo.setFixedWidth(72)
 
         msa_widget = QtWidgets.QWidget()
+        msa_widget.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed
+        )
         msa_layout = QtWidgets.QHBoxLayout(msa_widget)
         msa_layout.setContentsMargins(0, 0, 0, 0)
         msa_layout.setSpacing(4)
         msa_layout.addWidget(self.model_combo, 1)
         msa_layout.addWidget(self.size_combo, 0)
-        msa_layout.addWidget(self.aspect_combo, 0)
         form.addRow("Model", msa_widget)
 
         self.output_dir_edit = QtWidgets.QLineEdit()
@@ -1298,55 +1598,66 @@ class AIGenPanel(QtWidgets.QWidget):
             QtWidgets.QSizePolicy.Policy.Fixed
         )
 
+        self.open_dir_btn = QtWidgets.QPushButton("打开")
+        self.open_dir_btn.setFixedWidth(72)
+
         output_widget = QtWidgets.QWidget()
+        output_widget.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed
+        )
         output_layout = QtWidgets.QHBoxLayout(output_widget)
         output_layout.setContentsMargins(0, 0, 0, 0)
         output_layout.setSpacing(4)
         output_layout.addWidget(self.output_dir_edit, 1)
-
-        self.open_dir_btn = QtWidgets.QPushButton("打开")
-        self.open_dir_btn.setFixedWidth(40)
         output_layout.addWidget(self.open_dir_btn, 0)
-
         form.addRow("Output", output_widget)
 
         self.prompt_edit = QtWidgets.QPlainTextEdit()
         self.prompt_edit.setPlaceholderText("例如：保留当前视角和主体轮廓，在模型表面生成机甲风喷漆、贴花和边缘磨损")
-        self.prompt_edit.setMinimumHeight(60)
-        self.prompt_edit.setMaximumHeight(82)
+        self.prompt_edit.setMinimumHeight(72)
+        self.prompt_edit.setMaximumHeight(96)
+        self.prompt_edit.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed
+        )
         form.addRow("Prompt", self.prompt_edit)
 
         self.mode_combo = QtWidgets.QComboBox()
         self.mode_combo.addItems([MODE_SINGLE, MODE_MULTI, MODE_UV_GUIDE])
-        self.mode_combo.setMinimumWidth(108)
-        self.mode_combo.setMaximumWidth(122)
+        self.mode_combo.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed
+        )
 
         self.multi_set_label = QtWidgets.QLabel("视角")
+
         self.multi_set_combo = QtWidgets.QComboBox()
         self.multi_set_combo.addItems(["4视角", "6视角"])
         self.multi_set_combo.setCurrentText("6视角")
-        self.multi_set_combo.setFixedWidth(64)
+        self.multi_set_combo.setFixedWidth(76)
 
         self.single_ref_check = QtWidgets.QCheckBox("参考图")
         self.single_ref_check.setStyleSheet("margin-left:4px;")
 
         self.single_ref_pick_btn = QtWidgets.QPushButton("选择文件")
-        self.single_ref_pick_btn.setFixedWidth(72)
+        self.single_ref_pick_btn.setFixedWidth(84)
         self.single_ref_pick_btn.setVisible(False)
 
         self.mode_row_widget = QtWidgets.QWidget()
+        self.mode_row_widget.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed
+        )
         mode_row_layout = QtWidgets.QHBoxLayout(self.mode_row_widget)
         mode_row_layout.setContentsMargins(0, 0, 0, 0)
         mode_row_layout.setSpacing(4)
-
-        mode_row_layout.addWidget(self.mode_combo, 0)
+        mode_row_layout.addWidget(self.mode_combo, 1)
         mode_row_layout.addWidget(self.multi_set_label, 0)
         mode_row_layout.addWidget(self.multi_set_combo, 0)
         mode_row_layout.addWidget(self.single_ref_check, 0)
         mode_row_layout.addWidget(self.single_ref_pick_btn, 0)
-        mode_row_layout.addStretch(1)
-
-        form.addRow(self.mode_row_widget)
+        form.addRow("Mode", self.mode_row_widget)
 
         layout.addLayout(form)
 
@@ -1354,31 +1665,35 @@ class AIGenPanel(QtWidgets.QWidget):
         btn_layout.setContentsMargins(0, 0, 0, 0)
         btn_layout.setSpacing(4)
 
+        btn_layout = QtWidgets.QHBoxLayout()
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.setSpacing(8)
+
         self.capture_btn = QtWidgets.QPushButton("截图")
         self.generate_btn = QtWidgets.QPushButton("生成")
         self.apply_btn = QtWidgets.QPushButton("映射")
-        self.save_as_btn = QtWidgets.QPushButton("另存为")
+        self.settings_btn = QtWidgets.QPushButton("设置")
 
-        for b in [self.capture_btn, self.generate_btn, self.apply_btn, self.save_as_btn]:
-            b.setMinimumHeight(28)
+        for b in [self.capture_btn, self.generate_btn, self.apply_btn, self.settings_btn]:
+            b.setMinimumHeight(30)
             b.setMinimumWidth(0)
             b.setSizePolicy(
-                QtWidgets.QSizePolicy.Policy.Fixed,
+                QtWidgets.QSizePolicy.Policy.Expanding,
                 QtWidgets.QSizePolicy.Policy.Fixed
             )
             b.setStyleSheet("""
                 QPushButton {
                     min-width: 0px;
-                    padding: 4px 24px;
+                    padding: 4px 16px;
                 }
             """)
 
         self.apply_btn.setEnabled(False)
 
-        btn_layout.addWidget(self.capture_btn)
-        btn_layout.addWidget(self.generate_btn)
-        btn_layout.addWidget(self.apply_btn)
-        btn_layout.addWidget(self.save_as_btn)
+        btn_layout.addWidget(self.capture_btn, 1)
+        btn_layout.addWidget(self.generate_btn, 1)
+        btn_layout.addWidget(self.apply_btn, 1)
+        btn_layout.addWidget(self.settings_btn, 1)
 
         layout.addLayout(btn_layout)
 
@@ -1443,7 +1758,7 @@ class AIGenPanel(QtWidgets.QWidget):
         self.capture_btn.clicked.connect(self.on_capture_clicked)
         self.generate_btn.clicked.connect(self.on_generate_clicked)
         self.apply_btn.clicked.connect(self.on_apply_clicked)
-        self.save_as_btn.clicked.connect(self.on_save_as_clicked)
+        self.settings_btn.clicked.connect(self.on_settings_clicked)
         self.open_dir_btn.clicked.connect(self.on_open_dir_clicked)
         self.output_dir_edit.editingFinished.connect(self.on_output_dir_changed)
 
@@ -1578,7 +1893,7 @@ class AIGenPanel(QtWidgets.QWidget):
     def current_output_dir(self, create=True):
         path = self.output_dir_edit.text().strip()
         if not path:
-            path = os.path.expanduser("~/Pictures/sp_ai_outputs")
+            path = self.settings_data.get("output_dir", DEFAULT_OUTPUT_DIR) or DEFAULT_OUTPUT_DIR
             self.output_dir_edit.setText(path)
         return ensure_dir(path) if create else path
 
@@ -2846,7 +3161,7 @@ class AIGenPanel(QtWidgets.QWidget):
                     output_dir=output_dir,
                     prompt=self.prompt_edit.toPlainText().strip(),
                     model=self.model_combo.currentText().strip(),
-                    aspect_ratio=self.aspect_combo.currentText().strip(),
+                    aspect_ratio=DEFAULT_ASPECT_RATIO,
                     image_size=self.size_combo.currentText().strip(),
                     camera_state=state,
                     extra={
@@ -2875,7 +3190,7 @@ class AIGenPanel(QtWidgets.QWidget):
             output_dir=output_dir,
             prompt=self.prompt_edit.toPlainText().strip(),
             model=self.model_combo.currentText().strip(),
-            aspect_ratio=self.aspect_combo.currentText().strip(),
+            aspect_ratio=DEFAULT_ASPECT_RATIO,
             image_size=self.size_combo.currentText().strip(),
             camera_state=None,
             extra={
@@ -2924,7 +3239,7 @@ class AIGenPanel(QtWidgets.QWidget):
                     output_dir=output_dir,
                     prompt=self.prompt_edit.toPlainText().strip(),
                     model=self.model_combo.currentText().strip(),
-                    aspect_ratio=self.aspect_combo.currentText().strip(),
+                    aspect_ratio=DEFAULT_ASPECT_RATIO,
                     image_size=self.size_combo.currentText().strip(),
                     camera_state=state,
                     extra={
@@ -2974,7 +3289,7 @@ class AIGenPanel(QtWidgets.QWidget):
                 output_dir=output_dir,
                 prompt=self.prompt_edit.toPlainText().strip(),
                 model=self.model_combo.currentText().strip(),
-                aspect_ratio=self.aspect_combo.currentText().strip(),
+                aspect_ratio=DEFAULT_ASPECT_RATIO,
                 image_size=self.size_combo.currentText().strip(),
                 camera_state=None,
                 extra={
@@ -3042,7 +3357,7 @@ class AIGenPanel(QtWidgets.QWidget):
                 output_dir=output_dir,
                 prompt=self.prompt_edit.toPlainText().strip(),
                 model=self.model_combo.currentText().strip(),
-                aspect_ratio=self.aspect_combo.currentText().strip(),
+                aspect_ratio=DEFAULT_ASPECT_RATIO,
                 image_size=self.size_combo.currentText().strip(),
                 camera_state=camera_state,
                 extra={
@@ -3093,7 +3408,7 @@ class AIGenPanel(QtWidgets.QWidget):
                 output_dir=output_dir,
                 prompt=self.prompt_edit.toPlainText().strip(),
                 model=self.model_combo.currentText().strip(),
-                aspect_ratio=self.aspect_combo.currentText().strip(),
+                aspect_ratio=DEFAULT_ASPECT_RATIO,
                 image_size=self.size_combo.currentText().strip(),
                 camera_state=camera_state,
                 extra={}
@@ -3120,18 +3435,20 @@ class AIGenPanel(QtWidgets.QWidget):
         return record
 
     def refresh_client_settings(self):
-        self.client.api_key = (DEFAULT_API_KEY or "").strip()
+        self.settings_data = load_plugin_settings()
+        s = self.settings_data
 
-        invalid_values = {
-            "",
-            "API_KEY",
-            "YOUR_API_KEY",
-            "填写API_KEY",
-            "None",
-            "null",
-        }
+        self.client.api_base = (s.get("api_base", API_BASE) or API_BASE).rstrip("/")
+        self.client.api_key = (s.get("api_key", "") or "").strip()
+        self.client.submit_path = normalize_api_path(s.get("submit_path"), SUBMIT_PATH)
+        self.client.result_path = normalize_api_path(s.get("result_path"), RESULT_PATH)
+        self.client.poll_interval = float(s.get("poll_interval", DEFAULT_POLL_INTERVAL))
+        self.client.poll_timeout = int(float(s.get("poll_timeout", DEFAULT_POLL_TIMEOUT)))
+        self.client.use_data_url_prefix = bool(s.get("use_data_url_prefix", False))
+        self.client.auth_mode = (s.get("auth_mode", "bearer") or "bearer").strip().lower()
 
-        if self.client.api_key in invalid_values:
+        invalid_values = {"", "API_KEY", "YOUR_API_KEY", "None", "null"}
+        if (self.client.api_key or "").strip() in invalid_values:
             self.client.api_key = ""
 
     def clear_generate_queue(self):
@@ -3144,7 +3461,7 @@ class AIGenPanel(QtWidgets.QWidget):
     def set_ui_busy(self, busy):
         self.capture_btn.setEnabled(not busy)
         self.generate_btn.setEnabled(not busy)
-        self.save_as_btn.setEnabled(not busy)
+        self.settings_btn.setEnabled(not busy)
         self.open_dir_btn.setEnabled(not busy)
         self.mode_combo.setEnabled(not busy)
         self.multi_set_combo.setEnabled(not busy)
@@ -3171,7 +3488,7 @@ class AIGenPanel(QtWidgets.QWidget):
         prompt = user_prompt
 
         model = self.model_combo.currentText().strip()
-        aspect_ratio = self.aspect_combo.currentText().strip()
+        aspect_ratio = DEFAULT_ASPECT_RATIO
         image_size = self.size_combo.currentText().strip()
         output_dir = self.current_output_dir(create=True)
 
@@ -3743,41 +4060,6 @@ class AIGenPanel(QtWidgets.QWidget):
 
         self._safe_apply_payload(dict(self.pending_apply_payload))
 
-    def on_save_as_clicked(self):
-        try:
-            path = None
-
-            current_result_item = self.result_list.currentItem()
-            if current_result_item is not None:
-                record = current_result_item.data(QtCore.Qt.ItemDataRole.UserRole) or {}
-                rp = record.get("result_path")
-                if rp and os.path.exists(rp):
-                    path = rp
-
-            if not path:
-                path = self.last_result_path
-
-            if not path or not os.path.exists(path):
-                raise RuntimeError("当前没有可保存的结果图")
-
-            file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
-                self,
-                "保存生成图",
-                os.path.expanduser("~/Pictures/generated.png"),
-                "PNG Images (*.png)"
-            )
-            if not file_path:
-                return
-
-            shutil.copyfile(path, file_path)
-            self.log("已另存为: {}".format(file_path))
-            self.status_label.setText("已另存为")
-
-        except Exception as e:
-            traceback.print_exc()
-            self.preview_tabs.setCurrentWidget(self.log_page)
-            self.set_status("另存为失败: {}".format(e))
-
     def on_open_dir_clicked(self):
         try:
             output_dir = self.current_output_dir(create=True)
@@ -3790,6 +4072,7 @@ class AIGenPanel(QtWidgets.QWidget):
             self.set_status("打开目录失败: {}".format(e))
 
     def on_output_dir_changed(self):
+        self.persist_output_dir_setting()
         self.clear_preview()
         self.reload_galleries(log_message=True)
 
