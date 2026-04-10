@@ -58,7 +58,15 @@ DEFAULT_POLL_TIMEOUT = 300
 DEFAULT_OUTPUT_DIR = os.path.expanduser("~/Pictures/sp_ai_outputs")
 
 PROVIDER_GRSAI = "grsai"
-PROVIDER_CUSTOM = "custom_compatible"
+PROVIDER_RUNNINGHUB = "runninghub"
+
+RUNNINGHUB_API_BASE = "https://www.runninghub.cn"
+RUNNINGHUB_DEFAULT_SUBMIT_PATH = "/openapi/v2/rhart-image-n-g31-flash/image-to-image"
+RUNNINGHUB_RESULT_PATH = "/openapi/v2/query"
+RUNNINGHUB_UPLOAD_PATH = "/openapi/v2/media/upload/binary"
+
+RUNNINGHUB_UPLOAD_DATA_URI = "data_uri"
+RUNNINGHUB_UPLOAD_BINARY = "upload_binary"
 
 PROVIDER_PRESETS = {
     PROVIDER_GRSAI: {
@@ -68,12 +76,14 @@ PROVIDER_PRESETS = {
         "result_path": "/v1/draw/result",
         "auth_mode": "bearer",
     },
-    PROVIDER_CUSTOM: {
-        "label": "自定义兼容平台",
-        "api_base": "",
-        "submit_path": "/v1/draw/nano-banana",
-        "result_path": "/v1/draw/result",
+    PROVIDER_RUNNINGHUB: {
+        "label": "RunningHub",
+        "api_base": RUNNINGHUB_API_BASE,
+        "submit_path": RUNNINGHUB_DEFAULT_SUBMIT_PATH,
+        "result_path": RUNNINGHUB_RESULT_PATH,
+        "upload_path": RUNNINGHUB_UPLOAD_PATH,
         "auth_mode": "bearer",
+        "upload_mode": RUNNINGHUB_UPLOAD_DATA_URI,
     },
 }
 
@@ -90,6 +100,11 @@ DEFAULT_SETTINGS = {
     "poll_timeout": DEFAULT_POLL_TIMEOUT,
     "use_data_url_prefix": False,
     "output_dir": DEFAULT_OUTPUT_DIR,
+
+    "runninghub_upload_path": RUNNINGHUB_UPLOAD_PATH,
+    "runninghub_upload_mode": RUNNINGHUB_UPLOAD_DATA_URI,
+
+    "provider_api_keys": {},
 }
 
 PLUGIN_TITLE = "AI View To Paint"
@@ -209,7 +224,7 @@ def plugin_settings_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 def plugin_settings_path():
-    return os.path.join(plugin_settings_dir(), "start_plugin_settings.json")
+    return os.path.join(plugin_settings_dir(), "AI_View_To_Paint.json")
 
 def merge_plugin_settings(data=None):
     settings = dict(DEFAULT_SETTINGS)
@@ -243,6 +258,43 @@ def merge_plugin_settings(data=None):
         settings["poll_timeout"] = DEFAULT_POLL_TIMEOUT
 
     settings["use_data_url_prefix"] = bool(settings.get("use_data_url_prefix", False))
+
+    settings["runninghub_upload_path"] = normalize_api_path(
+        settings.get("runninghub_upload_path"),
+        preset.get("upload_path", RUNNINGHUB_UPLOAD_PATH)
+    )
+
+    upload_mode = str(
+        settings.get("runninghub_upload_mode", preset.get("upload_mode", RUNNINGHUB_UPLOAD_DATA_URI)) or
+        RUNNINGHUB_UPLOAD_DATA_URI
+    ).strip().lower()
+
+    if upload_mode not in (RUNNINGHUB_UPLOAD_DATA_URI, RUNNINGHUB_UPLOAD_BINARY):
+        upload_mode = RUNNINGHUB_UPLOAD_DATA_URI
+
+    settings["runninghub_upload_mode"] = upload_mode
+
+    provider_api_keys = settings.get("provider_api_keys", {})
+    if not isinstance(provider_api_keys, dict):
+        provider_api_keys = {}
+
+    normalized_provider_api_keys = {}
+    for k, v in provider_api_keys.items():
+        key_name = str(k or "").strip()
+        if not key_name:
+            continue
+        normalized_provider_api_keys[key_name] = str(v or "").strip()
+
+    settings["provider_api_keys"] = normalized_provider_api_keys
+
+    current_provider = settings.get("provider", PROVIDER_GRSAI)
+    current_api_key = str(settings.get("api_key", "") or "").strip()
+
+    if current_api_key:
+        settings["provider_api_keys"][current_provider] = current_api_key
+    else:
+        settings["api_key"] = settings["provider_api_keys"].get(current_provider, "")
+
     return settings
 
 
@@ -287,6 +339,61 @@ def http_post_json(url, headers, payload, timeout=120):
             status_code = resp.getcode()
             body = resp.read()
             text = body.decode("utf-8", errors="replace")
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            return status_code, text, parsed
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError("HTTPError {}: {}".format(e.code, body))
+    except urllib.error.URLError as e:
+        raise RuntimeError("URLError: {}".format(e))
+
+
+def http_post_multipart(url, headers=None, fields=None, files=None, timeout=120):
+    import uuid
+
+    boundary = "----WebKitFormBoundary{}".format(uuid.uuid4().hex)
+    body = bytearray()
+
+    def add_field(name, value):
+        body.extend(("--{}\r\n".format(boundary)).encode("utf-8"))
+        body.extend(('Content-Disposition: form-data; name="{}"\r\n\r\n'.format(name)).encode("utf-8"))
+        body.extend(str(value).encode("utf-8"))
+        body.extend(b"\r\n")
+
+    def add_file(name, filename, content, content_type="application/octet-stream"):
+        body.extend(("--{}\r\n".format(boundary)).encode("utf-8"))
+        body.extend(
+            ('Content-Disposition: form-data; name="{}"; filename="{}"\r\n'.format(name, filename)).encode("utf-8")
+        )
+        body.extend(("Content-Type: {}\r\n\r\n".format(content_type)).encode("utf-8"))
+        body.extend(content)
+        body.extend(b"\r\n")
+
+    for k, v in (fields or {}).items():
+        add_field(k, v)
+
+    for f in (files or []):
+        add_file(
+            f["name"],
+            f.get("filename", "file.bin"),
+            f.get("content", b""),
+            f.get("content_type", "application/octet-stream")
+        )
+
+    body.extend(("--{}--\r\n".format(boundary)).encode("utf-8"))
+
+    req_headers = dict(headers or {})
+    req_headers["Content-Type"] = "multipart/form-data; boundary={}".format(boundary)
+
+    req = urllib.request.Request(url=url, data=bytes(body), headers=req_headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
+            status_code = resp.getcode()
+            raw = resp.read()
+            text = raw.decode("utf-8", errors="replace")
             try:
                 parsed = json.loads(text)
             except Exception:
@@ -1113,11 +1220,306 @@ class NanoBananaClient(object):
         return self.download_image(image_url, cancel_cb=cancel_cb)
 
 
+class RunningHubClient(object):
+    def __init__(
+        self,
+        api_base,
+        api_key,
+        submit_path=RUNNINGHUB_DEFAULT_SUBMIT_PATH,
+        result_path=RUNNINGHUB_RESULT_PATH,
+        upload_path=RUNNINGHUB_UPLOAD_PATH,
+        poll_interval=DEFAULT_POLL_INTERVAL,
+        poll_timeout=DEFAULT_POLL_TIMEOUT,
+        auth_mode="bearer",
+        upload_mode=RUNNINGHUB_UPLOAD_DATA_URI,
+    ):
+        self.api_base = (api_base or RUNNINGHUB_API_BASE).rstrip("/")
+        self.api_key = api_key
+        self.submit_path = submit_path
+        self.result_path = result_path
+        self.upload_path = upload_path
+        self.poll_interval = poll_interval
+        self.poll_timeout = poll_timeout
+        self.auth_mode = auth_mode
+        self.upload_mode = upload_mode
+
+    def _headers(self, include_content_type=True):
+        headers = {}
+        if include_content_type:
+            headers["Content-Type"] = "application/json"
+
+        api_key = (self.api_key or "").strip()
+        if api_key:
+            auth_mode = (self.auth_mode or "bearer").strip().lower()
+            if auth_mode == "raw":
+                headers["Authorization"] = api_key
+            else:
+                headers["Authorization"] = "Bearer {}".format(api_key)
+        return headers
+
+    def image_file_to_data_uri(self, image_path):
+        data = read_binary(image_path)
+        ext = os.path.splitext(image_path)[1].lower()
+        mime = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+            ".bmp": "image/bmp",
+        }.get(ext, "application/octet-stream")
+        b64 = base64.b64encode(data).decode("utf-8")
+        return "data:{};base64,{}".format(mime, b64)
+
+    def upload_binary_and_get_url(self, image_path):
+        url = self.api_base + self.upload_path
+        filename = os.path.basename(image_path)
+        ext = os.path.splitext(filename)[1].lower()
+        mime = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+            ".bmp": "image/bmp",
+        }.get(ext, "application/octet-stream")
+
+        _, text, data = http_post_multipart(
+            url=url,
+            headers=self._headers(include_content_type=False),
+            files=[{
+                "name": "file",
+                "filename": filename,
+                "content": read_binary(image_path),
+                "content_type": mime,
+            }],
+            timeout=60
+        )
+
+        if not isinstance(data, dict):
+            raise RuntimeError("RunningHub 上传返回不是 JSON: {}".format(text))
+
+        if data.get("code") != 0:
+            raise RuntimeError("RunningHub 上传失败: {}".format(text))
+
+        data_obj = data.get("data") or {}
+        download_url = str(data_obj.get("download_url", "") or "").strip()
+        if not download_url:
+            raise RuntimeError("RunningHub 上传成功但缺少 data.download_url: {}".format(text))
+
+        return download_url
+
+    def _map_aspect_ratio(self, aspect_ratio):
+        text = str(aspect_ratio or "").strip().lower()
+        if not text or text == "auto":
+            return "1:1"
+
+        mapping = {
+            "1:1": "1:1",
+            "16:9": "16:9",
+            "9:16": "9:16",
+            "4:3": "4:3",
+            "3:4": "3:4",
+            "3:2": "3:2",
+            "2:3": "2:3",
+            "5:4": "5:4",
+            "4:5": "4:5",
+            "21:9": "21:9",
+            "1:4": "1:4",
+            "4:1": "4:1",
+            "1:8": "1:8",
+            "8:1": "8:1",
+        }
+        return mapping.get(text, "1:1")
+
+    def _map_resolution(self, image_size):
+        text = str(image_size or "").strip().lower()
+        mapping = {
+            "1k": "1k",
+            "2k": "2k",
+            "4k": "4k",
+        }
+        return mapping.get(text, "1k")
+
+    def build_image_url_value(self, image_path):
+        mode = (self.upload_mode or RUNNINGHUB_UPLOAD_DATA_URI).strip().lower()
+        if mode == RUNNINGHUB_UPLOAD_BINARY:
+            return self.upload_binary_and_get_url(image_path)
+        return self.image_file_to_data_uri(image_path)
+
+    def submit_task(self, image_path, prompt, model, aspect_ratio, image_size, shut_progress=True, cancel_cb=None):
+        if cancel_cb and cancel_cb():
+            raise RuntimeError("已取消")
+
+        image_value = self.build_image_url_value(image_path)
+
+        payload = {
+            "imageUrls": [image_value],
+            "prompt": prompt,
+            "aspectRatio": self._map_aspect_ratio(aspect_ratio),
+            "resolution": self._map_resolution(image_size),
+        }
+
+        url = self.api_base + self.submit_path
+        _, text, data = http_post_json(
+            url=url,
+            headers=self._headers(include_content_type=True),
+            payload=payload,
+            timeout=60
+        )
+
+        if cancel_cb and cancel_cb():
+            raise RuntimeError("已取消")
+
+        if not isinstance(data, dict):
+            raise RuntimeError("RunningHub 提交接口返回不是 JSON: {}".format(text))
+
+        task_id = str(data.get("taskId", "") or "").strip()
+        if not task_id:
+            raise RuntimeError("RunningHub 提交成功但缺少 taskId: {}".format(text))
+
+        return task_id
+
+    def query_result(self, task_id, cancel_cb=None):
+        if cancel_cb and cancel_cb():
+            raise RuntimeError("已取消")
+
+        url = self.api_base + self.result_path
+        payload = {"taskId": task_id}
+
+        _, text, data = http_post_json(
+            url=url,
+            headers=self._headers(include_content_type=True),
+            payload=payload,
+            timeout=20
+        )
+
+        if cancel_cb and cancel_cb():
+            raise RuntimeError("已取消")
+
+        if not isinstance(data, dict):
+            raise RuntimeError("RunningHub 结果接口返回不是 JSON: {}".format(text))
+
+        return data
+
+    def poll_result_url(self, task_id, progress_cb=None, cancel_cb=None):
+        start_time = time.time()
+        last_resp = None
+        transient_error_count = 0
+        max_transient_errors = 8
+
+        while True:
+            if cancel_cb and cancel_cb():
+                raise RuntimeError("已取消")
+
+            elapsed = time.time() - start_time
+            if elapsed > self.poll_timeout:
+                raise TimeoutError(
+                    "轮询超时 {} 秒，最后响应: {}".format(
+                        self.poll_timeout,
+                        json.dumps(last_resp, ensure_ascii=False) if last_resp else "None"
+                    )
+                )
+
+            try:
+                data = self.query_result(task_id, cancel_cb=cancel_cb)
+                last_resp = data
+                transient_error_count = 0
+            except Exception as e:
+                transient_error_count += 1
+                msg = str(e)
+                is_transient = (
+                    "UNEXPECTED_EOF_WHILE_READING" in msg or
+                    "SSLEOFError" in msg or
+                    "URLError" in msg or
+                    "timed out" in msg.lower() or
+                    "timeout" in msg.lower() or
+                    "connection reset" in msg.lower()
+                )
+
+                if not is_transient or transient_error_count > max_transient_errors:
+                    raise RuntimeError("查询结果失败（已重试{}次）: {}".format(transient_error_count - 1, e))
+
+                if progress_cb:
+                    progress_cb("结果轮询网络波动，正在重试({}/{})...".format(
+                        transient_error_count, max_transient_errors
+                    ))
+
+                wait_left = min(2.0, self.poll_interval)
+                while wait_left > 0:
+                    if cancel_cb and cancel_cb():
+                        raise RuntimeError("已取消")
+                    step = min(0.2, wait_left)
+                    time.sleep(step)
+                    wait_left -= step
+                continue
+
+            status = str(data.get("status", "") or "").strip().upper()
+
+            if progress_cb:
+                progress_cb("任务中... status={}".format(status or "UNKNOWN"))
+
+            if status == "SUCCESS":
+                results = data.get("results", [])
+                if not results:
+                    raise RuntimeError("任务成功，但 results 为空")
+                first = results[0] or {}
+                image_url = first.get("url")
+                if not image_url:
+                    raise RuntimeError("任务成功，但 results[0].url 为空")
+                return image_url
+
+            if status == "FAILED":
+                error_code = data.get("errorCode", "")
+                error_message = data.get("errorMessage", "")
+                failed_reason = data.get("failedReason", "")
+                raise RuntimeError(
+                    "生成失败: errorCode={}, errorMessage={}, failedReason={}".format(
+                        error_code, error_message, failed_reason
+                    )
+                )
+
+            wait_left = self.poll_interval
+            while wait_left > 0:
+                if cancel_cb and cancel_cb():
+                    raise RuntimeError("已取消")
+                step = min(0.2, wait_left)
+                time.sleep(step)
+                wait_left -= step
+
+    def download_image(self, image_url, cancel_cb=None):
+        if cancel_cb and cancel_cb():
+            raise RuntimeError("已取消")
+        return http_get_bytes(image_url, timeout=60)
+
+    def generate_from_image(self, image_path, prompt, model, aspect_ratio, image_size, shut_progress=True, progress_cb=None, cancel_cb=None):
+        if not self.api_key:
+            raise RuntimeError("API Key 为空")
+
+        task_id = self.submit_task(
+            image_path=image_path,
+            prompt=prompt,
+            model=model,
+            aspect_ratio=aspect_ratio,
+            image_size=image_size,
+            shut_progress=shut_progress,
+            cancel_cb=cancel_cb
+        )
+
+        if progress_cb:
+            progress_cb("任务已提交，ID={}".format(task_id))
+
+        image_url = self.poll_result_url(task_id, progress_cb=progress_cb, cancel_cb=cancel_cb)
+
+        if progress_cb:
+            progress_cb("结果已完成，正在下载图片...")
+
+        return self.download_image(image_url, cancel_cb=cancel_cb)
+
+
 def build_image_client(settings_data):
     s = merge_plugin_settings(settings_data)
     provider = s.get("provider", PROVIDER_GRSAI)
 
-    if provider in (PROVIDER_GRSAI, PROVIDER_CUSTOM):
+    if provider == PROVIDER_GRSAI:
         return NanoBananaClient(
             api_base=s["api_base"],
             api_key=s["api_key"],
@@ -1127,6 +1529,19 @@ def build_image_client(settings_data):
             poll_timeout=s["poll_timeout"],
             use_data_url_prefix=s["use_data_url_prefix"],
             auth_mode=s["auth_mode"],
+        )
+
+    if provider == PROVIDER_RUNNINGHUB:
+        return RunningHubClient(
+            api_base=s["api_base"],
+            api_key=s["api_key"],
+            submit_path=s["submit_path"],
+            result_path=s["result_path"],
+            upload_path=s["runninghub_upload_path"],
+            poll_interval=s["poll_interval"],
+            poll_timeout=s["poll_timeout"],
+            auth_mode=s["auth_mode"],
+            upload_mode=s["runninghub_upload_mode"],
         )
 
     raise RuntimeError("不支持的平台类型: {}".format(provider))
@@ -1328,16 +1743,18 @@ class SettingsDialog(QtWidgets.QDialog):
     def __init__(self, settings_data=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("设置")
-        self.resize(520, 320)
+        self.resize(560, 380)
 
         self.settings_data = merge_plugin_settings(settings_data)
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
+        root.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
 
         tip = QtWidgets.QLabel("配置API接口。")
         tip.setStyleSheet("color:#cfcfcf;")
+        tip.setWordWrap(True)
         root.addWidget(tip)
 
         self.form = QtWidgets.QFormLayout()
@@ -1347,7 +1764,7 @@ class SettingsDialog(QtWidgets.QDialog):
 
         self.provider_combo = QtWidgets.QComboBox()
         self.provider_combo.addItem("GRSAI", PROVIDER_GRSAI)
-        self.provider_combo.addItem("自定义平台", PROVIDER_CUSTOM)
+        self.provider_combo.addItem("RunningHub", PROVIDER_RUNNINGHUB)
         idx = self.provider_combo.findData(self.settings_data.get("provider", PROVIDER_GRSAI))
         if idx >= 0:
             self.provider_combo.setCurrentIndex(idx)
@@ -1389,6 +1806,21 @@ class SettingsDialog(QtWidgets.QDialog):
         self.form.addRow("提交路径", self.submit_path_edit)
         self.form.addRow("结果路径", self.result_path_edit)
 
+        self.runninghub_upload_path_edit = QtWidgets.QLineEdit(
+            self.settings_data.get("runninghub_upload_path", RUNNINGHUB_UPLOAD_PATH)
+        )
+        self.form.addRow("上传路径", self.runninghub_upload_path_edit)
+
+        self.runninghub_upload_mode_combo = QtWidgets.QComboBox()
+        self.runninghub_upload_mode_combo.addItem("Base64 Data URI", RUNNINGHUB_UPLOAD_DATA_URI)
+        self.runninghub_upload_mode_combo.addItem("先上传文件再传URL", RUNNINGHUB_UPLOAD_BINARY)
+        idx = self.runninghub_upload_mode_combo.findData(
+            self.settings_data.get("runninghub_upload_mode", RUNNINGHUB_UPLOAD_DATA_URI)
+        )
+        if idx >= 0:
+            self.runninghub_upload_mode_combo.setCurrentIndex(idx)
+        self.form.addRow("上传方式", self.runninghub_upload_mode_combo)
+
         btn_box = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok |
             QtWidgets.QDialogButtonBox.StandardButton.Cancel
@@ -1397,34 +1829,78 @@ class SettingsDialog(QtWidgets.QDialog):
         btn_box.rejected.connect(self.reject)
         root.addWidget(btn_box)
 
+        root.addStretch(1)
+
+        self._last_provider_for_key_switch = None
         self.provider_combo.currentIndexChanged.connect(self.on_provider_changed)
         self.on_provider_changed()
 
     def on_provider_changed(self):
-        provider = self.provider_combo.currentData()
+        old_provider = getattr(self, "_last_provider_for_key_switch", None)
+        new_provider = self.provider_combo.currentData()
+
+        provider_api_keys = dict(self.settings_data.get("provider_api_keys", {}) or {})
+
+        if old_provider:
+            provider_api_keys[old_provider] = self.api_key_edit.text().strip()
+
+        self.settings_data["provider_api_keys"] = provider_api_keys
+        self._last_provider_for_key_switch = new_provider
+
+        provider = new_provider
         preset = PROVIDER_PRESETS.get(provider, {})
-        is_custom = (provider == PROVIDER_CUSTOM)
+        is_runninghub = (provider == PROVIDER_RUNNINGHUB)
 
         submit_label = self.form.labelForField(self.submit_path_edit)
         result_label = self.form.labelForField(self.result_path_edit)
+        upload_label = self.form.labelForField(self.runninghub_upload_path_edit)
+        upload_mode_label = self.form.labelForField(self.runninghub_upload_mode_combo)
 
-        self.submit_path_edit.setVisible(is_custom)
-        self.result_path_edit.setVisible(is_custom)
+        show_submit_result = is_runninghub
+        self.submit_path_edit.setVisible(show_submit_result)
+        self.result_path_edit.setVisible(show_submit_result)
 
         if submit_label is not None:
-            submit_label.setVisible(is_custom)
+            submit_label.setVisible(show_submit_result)
         if result_label is not None:
-            result_label.setVisible(is_custom)
+            result_label.setVisible(show_submit_result)
+
+        self.runninghub_upload_path_edit.setVisible(is_runninghub)
+        self.runninghub_upload_mode_combo.setVisible(is_runninghub)
+
+        if upload_label is not None:
+            upload_label.setVisible(is_runninghub)
+        if upload_mode_label is not None:
+            upload_mode_label.setVisible(is_runninghub)
+
+        provider_key = provider_api_keys.get(provider, "")
+        self.api_key_edit.setText(provider_key)
 
         if provider == PROVIDER_GRSAI:
-            if not self.api_base_edit.text().strip():
-                self.api_base_edit.setText(preset.get("api_base", ""))
+            self.api_base_edit.setText(preset.get("api_base", ""))
             self.submit_path_edit.setText(preset.get("submit_path", SUBMIT_PATH))
             self.result_path_edit.setText(preset.get("result_path", RESULT_PATH))
 
             idx = self.auth_mode_combo.findData(preset.get("auth_mode", "bearer"))
             if idx >= 0:
                 self.auth_mode_combo.setCurrentIndex(idx)
+
+        elif provider == PROVIDER_RUNNINGHUB:
+            self.api_base_edit.setText(preset.get("api_base", RUNNINGHUB_API_BASE))
+            if not self.submit_path_edit.text().strip():
+                self.submit_path_edit.setText(preset.get("submit_path", RUNNINGHUB_DEFAULT_SUBMIT_PATH))
+            self.result_path_edit.setText(preset.get("result_path", RUNNINGHUB_RESULT_PATH))
+            self.runninghub_upload_path_edit.setText(preset.get("upload_path", RUNNINGHUB_UPLOAD_PATH))
+
+            idx = self.auth_mode_combo.findData(preset.get("auth_mode", "bearer"))
+            if idx >= 0:
+                self.auth_mode_combo.setCurrentIndex(idx)
+
+            idx = self.runninghub_upload_mode_combo.findData(
+                self.settings_data.get("runninghub_upload_mode", preset.get("upload_mode", RUNNINGHUB_UPLOAD_DATA_URI))
+            )
+            if idx >= 0:
+                self.runninghub_upload_mode_combo.setCurrentIndex(idx)
 
     def on_pick_output_dir(self):
         path = QtWidgets.QFileDialog.getExistingDirectory(
@@ -1439,13 +1915,23 @@ class SettingsDialog(QtWidgets.QDialog):
         provider = self.provider_combo.currentData()
         preset = PROVIDER_PRESETS.get(provider, {})
 
+        provider_api_keys = dict(self.settings_data.get("provider_api_keys", {}) or {})
+        provider_api_keys[provider] = self.api_key_edit.text().strip()
+
         return merge_plugin_settings({
             "provider": provider,
             "api_base": self.api_base_edit.text().strip(),
             "api_key": self.api_key_edit.text().strip(),
+            "provider_api_keys": provider_api_keys,
             "auth_mode": self.auth_mode_combo.currentData(),
-            "submit_path": self.submit_path_edit.text().strip() if provider == PROVIDER_CUSTOM else preset.get("submit_path", SUBMIT_PATH),
-            "result_path": self.result_path_edit.text().strip() if provider == PROVIDER_CUSTOM else preset.get("result_path", RESULT_PATH),
+            "submit_path": self.submit_path_edit.text().strip() if provider == PROVIDER_RUNNINGHUB else preset.get(
+                "submit_path", SUBMIT_PATH),
+            "result_path": self.result_path_edit.text().strip() if provider == PROVIDER_RUNNINGHUB else preset.get(
+                "result_path", RESULT_PATH),
+            "runninghub_upload_path": self.runninghub_upload_path_edit.text().strip() if provider == PROVIDER_RUNNINGHUB else preset.get(
+                "upload_path", RUNNINGHUB_UPLOAD_PATH),
+            "runninghub_upload_mode": self.runninghub_upload_mode_combo.currentData() if provider == PROVIDER_RUNNINGHUB else preset.get(
+                "upload_mode", RUNNINGHUB_UPLOAD_DATA_URI),
             "default_model": self.model_edit.text().strip(),
             "output_dir": self.output_dir_edit.text().strip(),
         })
@@ -3444,8 +3930,21 @@ class AIGenPanel(QtWidgets.QWidget):
         self.client.result_path = normalize_api_path(s.get("result_path"), RESULT_PATH)
         self.client.poll_interval = float(s.get("poll_interval", DEFAULT_POLL_INTERVAL))
         self.client.poll_timeout = int(float(s.get("poll_timeout", DEFAULT_POLL_TIMEOUT)))
-        self.client.use_data_url_prefix = bool(s.get("use_data_url_prefix", False))
         self.client.auth_mode = (s.get("auth_mode", "bearer") or "bearer").strip().lower()
+
+        if hasattr(self.client, "use_data_url_prefix"):
+            self.client.use_data_url_prefix = bool(s.get("use_data_url_prefix", False))
+
+        if hasattr(self.client, "upload_path"):
+            self.client.upload_path = normalize_api_path(
+                s.get("runninghub_upload_path"),
+                RUNNINGHUB_UPLOAD_PATH
+            )
+
+        if hasattr(self.client, "upload_mode"):
+            self.client.upload_mode = str(
+                s.get("runninghub_upload_mode", RUNNINGHUB_UPLOAD_DATA_URI) or RUNNINGHUB_UPLOAD_DATA_URI
+            ).strip().lower()
 
         invalid_values = {"", "API_KEY", "YOUR_API_KEY", "None", "null"}
         if (self.client.api_key or "").strip() in invalid_values:
