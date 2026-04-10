@@ -4347,6 +4347,11 @@ class AIGenPanel(QtWidgets.QWidget):
             base = float(PROJECTOR_GLOBAL_SCALE_MULTIPLIER)
             scale = [base, base, base]
 
+        if slot_name in ("front", "back"):
+            culling_hardness = 0.75
+        else:
+            culling_hardness = 0.0
+
         projection_3d = sp_layerstack.Projection3DParams(
             offset=offset,
             rotation=rotation,
@@ -4357,8 +4362,14 @@ class AIGenPanel(QtWidgets.QWidget):
             filtering_mode=sp_layerstack.FilteringMode.BilinearHQ,
             uv_wrapping_mode=sp_layerstack.UVWrapMode.RepeatNone,
             shape_crop_mode=sp_layerstack.ShapeCropMode.CroppedToShape,
-            depth_culling=sp_layerstack.ProjectionCullingParams(enabled=True, hardness=0.85),
-            backface_culling=sp_layerstack.ProjectionCullingParams(enabled=True, hardness=0.85),
+            depth_culling=sp_layerstack.ProjectionCullingParams(
+                enabled=True,
+                hardness=culling_hardness
+            ),
+            backface_culling=sp_layerstack.ProjectionCullingParams(
+                enabled=True,
+                hardness=culling_hardness
+            ),
             backface_culling_angle=90.0,
             uv_transformation=sp_layerstack.UVTransformationParams(
                 scale_mode=sp_layerstack.ScaleMode.Factors,
