@@ -1,6 +1,8 @@
 此插件运行在 Substance 3D Painter 11 以上版本，通过 NanoBanana 绘制贴图。
 
-默认对接此 API 对接方式：https://grsai.com/zh
+API 接口：https://grsai.com/zh
+
+API 接口：https://www.runninghub.cn/
 
 API eky 在设置界面填写即可
  
