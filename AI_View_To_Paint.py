@@ -3213,15 +3213,11 @@ class AIGenPanel(QtWidgets.QWidget):
         }
 
     def save_capture_record(
-        self,
-        pixmap,
-        output_dir,
-        prompt="",
-        model="",
-        aspect_ratio="",
-        image_size="",
-        camera_state=None,
-        extra=None
+            self,
+            pixmap,
+            output_dir,
+            camera_state=None,
+            extra=None
     ):
         ensure_dir(output_dir)
         stamp = unique_stamp()
@@ -3238,11 +3234,6 @@ class AIGenPanel(QtWidgets.QWidget):
             "time": now_str_readable(),
             "stamp": stamp,
             "capture_path": image_path,
-            "result_path": "",
-            "prompt": prompt or "",
-            "model": model or "",
-            "aspect_ratio": aspect_ratio or "",
-            "image_size": image_size or "",
             "camera_state": camera_state or None,
             "meta_path": meta_path,
         }
@@ -3254,7 +3245,9 @@ class AIGenPanel(QtWidgets.QWidget):
 
     def record_tooltip(self, record):
         lines = []
-        lines.append("时间: {}".format(record.get("time", "")))
+
+        if record.get("time"):
+            lines.append("时间: {}".format(record.get("time", "")))
 
         if record.get("is_normal_result"):
             lines.append("类型: 法线结果")
@@ -3272,15 +3265,19 @@ class AIGenPanel(QtWidgets.QWidget):
             lines.append("类型: 多视角结果")
         elif record.get("type") == "result":
             lines.append("类型: 单视角结果")
+        else:
+            lines.append("类型: 截图")
 
-        if record.get("model"):
-            lines.append("Model: {}".format(record.get("model", "")))
-        if record.get("aspect_ratio"):
-            lines.append("Aspect: {}".format(record.get("aspect_ratio", "")))
-        if record.get("image_size"):
-            lines.append("Size: {}".format(record.get("image_size", "")))
-        if record.get("prompt"):
-            lines.append("Prompt: {}".format(record.get("prompt", "")))
+        if record.get("type") == "result":
+            if record.get("model"):
+                lines.append("Model: {}".format(record.get("model", "")))
+            if record.get("aspect_ratio"):
+                lines.append("Aspect: {}".format(record.get("aspect_ratio", "")))
+            if record.get("image_size"):
+                lines.append("Size: {}".format(record.get("image_size", "")))
+            if record.get("prompt"):
+                lines.append("Prompt: {}".format(record.get("prompt", "")))
+
         if record.get("capture_path"):
             lines.append("Capture: {}".format(record.get("capture_path", "")))
         if record.get("result_path"):
@@ -3288,6 +3285,7 @@ class AIGenPanel(QtWidgets.QWidget):
         if record.get("normal_source_mode"):
             lines.append("法线来源: {}".format(record.get("normal_source_mode", "")))
         lines.append("Camera: {}".format("yes" if record.get("camera_state") else "no"))
+
         return "\n".join(lines)
 
     def create_thumb_item(self, record, image_path, lazy_icon=False, lazy_text="AI"):
@@ -3354,7 +3352,9 @@ class AIGenPanel(QtWidgets.QWidget):
 
     def update_preview_info(self, record, image_path):
         parts = []
-        parts.append("时间: {}".format(record.get("time", "")))
+
+        if record.get("time"):
+            parts.append("时间: {}".format(record.get("time", "")))
 
         if record.get("is_normal_result"):
             parts.append("类型: 法线结果")
@@ -3385,16 +3385,18 @@ class AIGenPanel(QtWidgets.QWidget):
         if record.get("normal_source_mode"):
             parts.append("法线来源: {}".format(record.get("normal_source_mode", "")))
 
-        if record.get("model"):
-            parts.append("Model: {}".format(record.get("model", "")))
-        if record.get("aspect_ratio"):
-            parts.append("Aspect: {}".format(record.get("aspect_ratio", "")))
-        if record.get("image_size"):
-            parts.append("Size: {}".format(record.get("image_size", "")))
+        if record.get("type") == "result":
+            if record.get("model"):
+                parts.append("Model: {}".format(record.get("model", "")))
+            if record.get("aspect_ratio"):
+                parts.append("Aspect: {}".format(record.get("aspect_ratio", "")))
+            if record.get("image_size"):
+                parts.append("Size: {}".format(record.get("image_size", "")))
+            if record.get("prompt"):
+                parts.append("Prompt: {}".format(record.get("prompt", "")))
+
         if image_path:
             parts.append("文件: {}".format(image_path))
-        if record.get("prompt"):
-            parts.append("Prompt: {}".format(record.get("prompt", "")))
 
         self.preview_info_label.setText("\n".join(parts))
 
@@ -3873,10 +3875,6 @@ class AIGenPanel(QtWidgets.QWidget):
                 rec = self.save_capture_record(
                     pixmap=pixmap,
                     output_dir=output_dir,
-                    prompt=self.prompt_edit.toPlainText().strip(),
-                    model=self.model_combo.currentText().strip(),
-                    aspect_ratio=DEFAULT_ASPECT_RATIO,
-                    image_size=self.size_combo.currentText().strip(),
                     camera_state=state,
                     extra={
                         "slot_name": slot_name,
@@ -3902,16 +3900,11 @@ class AIGenPanel(QtWidgets.QWidget):
         atlas_record = self.save_capture_record(
             pixmap=atlas_pixmap,
             output_dir=output_dir,
-            prompt=self.prompt_edit.toPlainText().strip(),
-            model=self.model_combo.currentText().strip(),
-            aspect_ratio=DEFAULT_ASPECT_RATIO,
-            image_size=self.size_combo.currentText().strip(),
             camera_state=None,
             extra={
                 "is_multiview_atlas": True
             }
         )
-
         manifest["atlas_path"] = atlas_record["capture_path"]
         atlas_record["multiview_manifest"] = manifest
         write_json(atlas_record["meta_path"], atlas_record)
@@ -3951,10 +3944,6 @@ class AIGenPanel(QtWidgets.QWidget):
                 rec = self.save_capture_record(
                     pixmap=pixmap,
                     output_dir=output_dir,
-                    prompt=self.prompt_edit.toPlainText().strip(),
-                    model=self.model_combo.currentText().strip(),
-                    aspect_ratio=DEFAULT_ASPECT_RATIO,
-                    image_size=self.size_combo.currentText().strip(),
                     camera_state=state,
                     extra={
                         "slot_name": slot_name,
@@ -4001,10 +3990,6 @@ class AIGenPanel(QtWidgets.QWidget):
             record = self.save_capture_record(
                 pixmap=composite_pixmap,
                 output_dir=output_dir,
-                prompt=self.prompt_edit.toPlainText().strip(),
-                model=self.model_combo.currentText().strip(),
-                aspect_ratio=DEFAULT_ASPECT_RATIO,
-                image_size=self.size_combo.currentText().strip(),
                 camera_state=None,
                 extra={
                     "mode": MODE_UV_GUIDE,
@@ -4013,7 +3998,6 @@ class AIGenPanel(QtWidgets.QWidget):
                     "uvguide_manifest": uvguide_manifest
                 }
             )
-
             write_json(record["meta_path"], record)
 
             self.add_capture_item(record, select=True, prepend=True, lazy_icon=False)
@@ -4084,10 +4068,6 @@ class AIGenPanel(QtWidgets.QWidget):
             record = self.save_capture_record(
                 pixmap=composite_pixmap,
                 output_dir=output_dir,
-                prompt=self.prompt_edit.toPlainText().strip(),
-                model=self.model_combo.currentText().strip(),
-                aspect_ratio=DEFAULT_ASPECT_RATIO,
-                image_size=self.size_combo.currentText().strip(),
                 camera_state=camera_state,
                 extra={
                     "mode": MODE_SINGLE,
@@ -4097,7 +4077,6 @@ class AIGenPanel(QtWidgets.QWidget):
                     "single_view_manifest": single_view_manifest,
                 }
             )
-
             write_json(record["meta_path"], record)
 
             self.add_capture_item(record, select=True, prepend=True, lazy_icon=False)
@@ -4139,16 +4118,11 @@ class AIGenPanel(QtWidgets.QWidget):
             record = self.save_capture_record(
                 pixmap=pixmap,
                 output_dir=output_dir,
-                prompt=self.prompt_edit.toPlainText().strip(),
-                model=self.model_combo.currentText().strip(),
-                aspect_ratio=DEFAULT_ASPECT_RATIO,
-                image_size=self.size_combo.currentText().strip(),
                 camera_state=camera_state,
                 extra={
                     "single_view_manifest": single_view_manifest
                 }
             )
-
             self.add_capture_item(record, select=True, prepend=True, lazy_icon=False)
             self.switch_preview_tab(self.capture_page, keep_selection=True)
             self.log("截图完成: {}".format(record["capture_path"]))
