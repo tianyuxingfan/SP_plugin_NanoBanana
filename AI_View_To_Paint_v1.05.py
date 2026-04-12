@@ -4858,7 +4858,7 @@ class AIGenPanel(QtWidgets.QWidget):
             self.status_label.setText("截图完成")
 
         except Exception as e:
-            traceback.print_exc()
+            self.log(traceback.format_exc())
             self.preview_tabs.setCurrentWidget(self.log_page)
             self.set_status("截图失败: {}".format(e))
 
@@ -5061,7 +5061,7 @@ class AIGenPanel(QtWidgets.QWidget):
                 except Exception:
                     pass
 
-            traceback.print_exc()
+            self.log(traceback.format_exc())
             self.preview_tabs.setCurrentWidget(self.log_page)
             self.set_status("转换法线失败: {}".format(e))
 
@@ -5932,7 +5932,7 @@ class AIGenPanel(QtWidgets.QWidget):
             self.refresh_apply_button_from_selection()
 
         except Exception as e:
-            traceback.print_exc()
+            self.log(traceback.format_exc())
             self.pending_apply_payload = payload
             self.apply_btn.setEnabled(True)
             self.preview_tabs.setCurrentWidget(self.log_page)
@@ -5958,7 +5958,7 @@ class AIGenPanel(QtWidgets.QWidget):
             self.log("已打开输出目录: {}".format(output_dir))
             self.status_label.setText("已打开输出目录")
         except Exception as e:
-            traceback.print_exc()
+            self.log(traceback.format_exc())
             self.preview_tabs.setCurrentWidget(self.log_page)
             self.set_status("打开目录失败: {}".format(e))
 
