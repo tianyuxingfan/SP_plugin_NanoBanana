@@ -12,6 +12,8 @@ import struct
 import zlib
 import threading
 import queue as py_queue
+from collections import deque
+from itertools import combinations
 import math
 
 import substance_painter.ui
@@ -162,6 +164,22 @@ DEFAULT_MULTI_TILE_SIZE = 1024
 DEFAULT_UV_GUIDE_TILE_SIZE = 1024
 DEFAULT_ATLAS_BG = "#242424"
 
+MULTIVIEW_SUBJECT_BG_TOLERANCE = 18
+MULTIVIEW_SUBJECT_PADDING = 12
+MULTIVIEW_SUBJECT_SAMPLE_STEP = 2
+
+MULTIVIEW_PACK_GAP = 18
+MULTIVIEW_PACK_OUTER_PADDING = 20
+MULTIVIEW_MAX_UPSCALE = 1.0
+
+MULTIVIEW_PACK_SIDE_4 = 2048
+MULTIVIEW_PACK_SIDE_6 = 2560
+
+MULTIVIEW_VIEWPORT_TRIM_LEFT = 6
+MULTIVIEW_VIEWPORT_TRIM_TOP = 24
+MULTIVIEW_VIEWPORT_TRIM_RIGHT = 6
+MULTIVIEW_VIEWPORT_TRIM_BOTTOM = 16
+
 MULTIVIEW_ROT_PRESETS = {
     "front": [0.0, 0.0, 0.0],
     "back": [0.0, 180.0, 0.0],
@@ -228,6 +246,16 @@ def normalize_api_path(path, default=""):
         text = "/" + text
     return text
 
+
+def get_image_size_safe(image_path):
+    try:
+        if image_path and os.path.exists(image_path):
+            img = QtGui.QImage(image_path)
+            if not img.isNull():
+                return img.width(), img.height()
+    except Exception:
+        pass
+    return 0, 0
 
 def plugin_settings_dir():
     return os.path.dirname(os.path.abspath(__file__))
@@ -506,125 +534,6 @@ def fit_pixmap_to_canvas(pixmap, width, height, bg="#000000"):
     return canvas
 
 
-def fit_pixmap_height_locked(pixmap, width, height, bg="#000000"):
-    if pixmap is None or pixmap.isNull():
-        raise RuntimeError("fit_pixmap_height_locked 输入图片无效")
-
-    src_w = pixmap.width()
-    src_h = pixmap.height()
-    if src_w <= 0 or src_h <= 0:
-        raise RuntimeError("输入图片尺寸无效")
-
-    scale = float(height) / float(src_h)
-    scaled_w = max(1, int(round(src_w * scale)))
-    scaled_h = int(height)
-
-    scaled = pixmap.scaled(
-        scaled_w,
-        scaled_h,
-        QtCore.Qt.AspectRatioMode.IgnoreAspectRatio,
-        QtCore.Qt.TransformationMode.SmoothTransformation
-    )
-
-    canvas = QtGui.QPixmap(width, height)
-    canvas.fill(QtGui.QColor(bg))
-
-    painter = QtGui.QPainter(canvas)
-    try:
-        if scaled_w > width:
-            src_x = int(round((scaled_w - width) * 0.5))
-            painter.drawPixmap(
-                QtCore.QRect(0, 0, width, height),
-                scaled,
-                QtCore.QRect(src_x, 0, width, height)
-            )
-        else:
-            dst_x = int(round((width - scaled_w) * 0.5))
-            painter.drawPixmap(dst_x, 0, scaled)
-    finally:
-        painter.end()
-
-    return canvas
-
-
-def normalize_square_height_locked(pixmap, size, bg=DEFAULT_ATLAS_BG):
-    if pixmap is None or pixmap.isNull():
-        raise RuntimeError("normalize_square_height_locked 输入图片无效")
-    side = max(1, int(size))
-    return fit_pixmap_height_locked(pixmap, side, side, bg=bg)
-
-
-def normalize_square_height_locked_with_manifest(pixmap, size, bg=DEFAULT_ATLAS_BG):
-    if pixmap is None or pixmap.isNull():
-        raise RuntimeError("normalize_square_height_locked_with_manifest 输入图片无效")
-
-    side = max(1, int(size))
-    src_w = pixmap.width()
-    src_h = pixmap.height()
-    if src_w <= 0 or src_h <= 0:
-        raise RuntimeError("输入图片尺寸无效")
-
-    scale = float(side) / float(src_h)
-    scaled_w = max(1, int(round(src_w * scale)))
-    scaled_h = side
-
-    scaled = pixmap.scaled(
-        scaled_w,
-        scaled_h,
-        QtCore.Qt.AspectRatioMode.IgnoreAspectRatio,
-        QtCore.Qt.TransformationMode.SmoothTransformation
-    )
-
-    canvas = QtGui.QPixmap(side, side)
-    canvas.fill(QtGui.QColor(bg))
-
-    placement_mode = "pad_x"
-    crop_left = 0
-    crop_right = 0
-    pad_left = 0
-    pad_right = 0
-    content_rect = [0, 0, side, side]
-
-    painter = QtGui.QPainter(canvas)
-    try:
-        if scaled_w > side:
-            placement_mode = "crop_x"
-            crop_left = int(round((scaled_w - side) * 0.5))
-            crop_right = max(0, scaled_w - side - crop_left)
-
-            painter.drawPixmap(
-                QtCore.QRect(0, 0, side, side),
-                scaled,
-                QtCore.QRect(crop_left, 0, side, side)
-            )
-            content_rect = [0, 0, side, side]
-        else:
-            placement_mode = "pad_x"
-            pad_left = int(round((side - scaled_w) * 0.5))
-            pad_right = max(0, side - scaled_w - pad_left)
-
-            painter.drawPixmap(pad_left, 0, scaled)
-            content_rect = [pad_left, 0, scaled_w, side]
-    finally:
-        painter.end()
-
-    manifest = {
-        "type": "single_view_manifest",
-        "fit_mode": "height_locked_square",
-        "source_size": [src_w, src_h],
-        "output_size": [side, side],
-        "scaled_size": [scaled_w, scaled_h],
-        "content_rect": content_rect,
-        "placement_mode": placement_mode,
-        "pad_left": pad_left,
-        "pad_right": pad_right,
-        "crop_left": crop_left,
-        "crop_right": crop_right,
-    }
-
-    return canvas, manifest
-
-
 def normalize_square_contain_with_manifest(pixmap, size, bg=DEFAULT_ATLAS_BG):
     if pixmap is None or pixmap.isNull():
         raise RuntimeError("normalize_square_contain_with_manifest 输入图片无效")
@@ -674,45 +583,751 @@ def normalize_square_contain_with_manifest(pixmap, size, bg=DEFAULT_ATLAS_BG):
     return canvas, manifest
 
 
-def draw_corner_label(painter, rect, text, margin=12):
-    if not text:
-        return
+def trim_pixmap_margins(
+    pixmap,
+    left=MULTIVIEW_VIEWPORT_TRIM_LEFT,
+    top=MULTIVIEW_VIEWPORT_TRIM_TOP,
+    right=MULTIVIEW_VIEWPORT_TRIM_RIGHT,
+    bottom=MULTIVIEW_VIEWPORT_TRIM_BOTTOM
+):
+    if pixmap is None or pixmap.isNull():
+        raise RuntimeError("trim_pixmap_margins 输入图片无效")
 
-    painter.save()
+    src_w = pixmap.width()
+    src_h = pixmap.height()
+    if src_w <= 0 or src_h <= 0:
+        raise RuntimeError("输入图片尺寸无效")
+
+    left = max(0, int(left))
+    top = max(0, int(top))
+    right = max(0, int(right))
+    bottom = max(0, int(bottom))
+
+    x = left
+    y = top
+    w = max(1, src_w - left - right)
+    h = max(1, src_h - top - bottom)
+
+    rect = QtCore.QRect(x, y, w, h)
+    trimmed = pixmap.copy(rect)
+
+    return trimmed, {
+        "original_size": [src_w, src_h],
+        "trim_rect": [x, y, w, h],
+    }
+
+
+def _avg_block_rgb(image, x0, y0, w, h):
+    img_w = image.width()
+    img_h = image.height()
+    if img_w <= 0 or img_h <= 0:
+        return [36, 36, 36]
+
+    x0 = max(0, min(int(x0), img_w - 1))
+    y0 = max(0, min(int(y0), img_h - 1))
+    w = max(1, min(int(w), img_w - x0))
+    h = max(1, min(int(h), img_h - y0))
+
+    rs, gs, bs = [], [], []
+    for yy in range(y0, y0 + h):
+        for xx in range(x0, x0 + w):
+            c = QtGui.QColor(image.pixel(xx, yy))
+            rs.append(c.red())
+            gs.append(c.green())
+            bs.append(c.blue())
+
+    if not rs:
+        return [36, 36, 36]
+
+    return [
+        int(sum(rs) / len(rs)),
+        int(sum(gs) / len(gs)),
+        int(sum(bs) / len(bs)),
+    ]
+
+
+def _estimate_border_bg_rgb(image, block_size=8):
+    w = image.width()
+    h = image.height()
+    if w <= 0 or h <= 0:
+        return [36, 36, 36]
+
+    b = max(1, int(block_size))
+
+    samples = [
+        _avg_block_rgb(image, 0, 0, b, b),
+        _avg_block_rgb(image, max(0, w - b), 0, b, b),
+        _avg_block_rgb(image, 0, max(0, h - b), b, b),
+        _avg_block_rgb(image, max(0, w - b), max(0, h - b), b, b),
+
+        _avg_block_rgb(image, max(0, int(w * 0.5) - b // 2), 0, b, b),
+        _avg_block_rgb(image, max(0, int(w * 0.5) - b // 2), max(0, h - b), b, b),
+        _avg_block_rgb(image, 0, max(0, int(h * 0.5) - b // 2), b, b),
+        _avg_block_rgb(image, max(0, w - b), max(0, int(h * 0.5) - b // 2), b, b),
+    ]
+
+    return [
+        int(sum(v[0] for v in samples) / len(samples)),
+        int(sum(v[1] for v in samples) / len(samples)),
+        int(sum(v[2] for v in samples) / len(samples)),
+    ]
+
+
+def _rgb_to_hex(rgb):
+    r = max(0, min(int(rgb[0]), 255))
+    g = max(0, min(int(rgb[1]), 255))
+    b = max(0, min(int(rgb[2]), 255))
+    return "#{:02x}{:02x}{:02x}".format(r, g, b)
+
+
+def _color_near_rgb(rgb, bg_rgb, tolerance):
+    return (
+        abs(int(rgb[0]) - int(bg_rgb[0])) <= tolerance and
+        abs(int(rgb[1]) - int(bg_rgb[1])) <= tolerance and
+        abs(int(rgb[2]) - int(bg_rgb[2])) <= tolerance
+    )
+
+
+def detect_subject_bbox_from_border_floodfill(
+    pixmap,
+    tolerance=MULTIVIEW_SUBJECT_BG_TOLERANCE,
+    padding=MULTIVIEW_SUBJECT_PADDING,
+    sample_step=MULTIVIEW_SUBJECT_SAMPLE_STEP
+):
+    if pixmap is None or pixmap.isNull():
+        raise RuntimeError("detect_subject_bbox_from_border_floodfill 输入图片无效")
+
+    image = pixmap.toImage().convertToFormat(QtGui.QImage.Format.Format_RGBA8888)
+    w = image.width()
+    h = image.height()
+    if w <= 0 or h <= 0:
+        return [0, 0, max(1, w), max(1, h)], {
+            "bg_rgb": [36, 36, 36],
+            "bg_hex": DEFAULT_ATLAS_BG,
+        }
+
+    step = max(1, int(sample_step))
+    tol = max(0, int(tolerance))
+    pad = max(0, int(padding))
+
+    bg_rgb = _estimate_border_bg_rgb(image, block_size=8)
+
+    grid_w = int(math.ceil(float(w) / float(step)))
+    grid_h = int(math.ceil(float(h) / float(step)))
+
+    def sample_cell_rgb(cx, cy):
+        px = min(w - 1, cx * step + step // 2)
+        py = min(h - 1, cy * step + step // 2)
+        c = QtGui.QColor(image.pixel(px, py))
+        return [c.red(), c.green(), c.blue()]
+
+    visited = [[False for _ in range(grid_w)] for _ in range(grid_h)]
+    is_bg = [[False for _ in range(grid_w)] for _ in range(grid_h)]
+
+    q = deque()
+
+    def try_seed(cx, cy):
+        if cx < 0 or cy < 0 or cx >= grid_w or cy >= grid_h:
+            return
+        if visited[cy][cx]:
+            return
+        visited[cy][cx] = True
+        rgb = sample_cell_rgb(cx, cy)
+        if _color_near_rgb(rgb, bg_rgb, tol):
+            is_bg[cy][cx] = True
+            q.append((cx, cy))
+
+    for cx in range(grid_w):
+        try_seed(cx, 0)
+        try_seed(cx, grid_h - 1)
+
+    for cy in range(grid_h):
+        try_seed(0, cy)
+        try_seed(grid_w - 1, cy)
+
+    while q:
+        cx, cy = q.popleft()
+        for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+            if nx < 0 or ny < 0 or nx >= grid_w or ny >= grid_h:
+                continue
+            if visited[ny][nx]:
+                continue
+            visited[ny][nx] = True
+            rgb = sample_cell_rgb(nx, ny)
+            if _color_near_rgb(rgb, bg_rgb, tol):
+                is_bg[ny][nx] = True
+                q.append((nx, ny))
+
+    fg_visited = [[False for _ in range(grid_w)] for _ in range(grid_h)]
+    components = []
+
+    img_cx = (grid_w - 1) * 0.5
+    img_cy = (grid_h - 1) * 0.5
+
+    for sy in range(grid_h):
+        for sx in range(grid_w):
+            if is_bg[sy][sx]:
+                continue
+            if fg_visited[sy][sx]:
+                continue
+
+            dq = deque()
+            dq.append((sx, sy))
+            fg_visited[sy][sx] = True
+
+            count = 0
+            min_cx = grid_w
+            min_cy = grid_h
+            max_cx = -1
+            max_cy = -1
+            sum_x = 0.0
+            sum_y = 0.0
+
+            touches_border = False
+
+            while dq:
+                cx, cy = dq.popleft()
+                count += 1
+                sum_x += cx
+                sum_y += cy
+
+                if cx < min_cx:
+                    min_cx = cx
+                if cy < min_cy:
+                    min_cy = cy
+                if cx > max_cx:
+                    max_cx = cx
+                if cy > max_cy:
+                    max_cy = cy
+
+                if cx == 0 or cy == 0 or cx == grid_w - 1 or cy == grid_h - 1:
+                    touches_border = True
+
+                for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                    if nx < 0 or ny < 0 or nx >= grid_w or ny >= grid_h:
+                        continue
+                    if fg_visited[ny][nx]:
+                        continue
+                    if is_bg[ny][nx]:
+                        continue
+                    fg_visited[ny][nx] = True
+                    dq.append((nx, ny))
+
+            if count <= 0:
+                continue
+
+            center_x = sum_x / float(count)
+            center_y = sum_y / float(count)
+
+            dist2 = (center_x - img_cx) ** 2 + (center_y - img_cy) ** 2
+            bbox_w = max_cx - min_cx + 1
+            bbox_h = max_cy - min_cy + 1
+            bbox_area = bbox_w * bbox_h
+
+            components.append({
+                "count": count,
+                "bbox": [min_cx, min_cy, bbox_w, bbox_h],
+                "center": [center_x, center_y],
+                "dist2": dist2,
+                "touches_border": touches_border,
+                "bbox_area": bbox_area,
+            })
+
+    if not components:
+        return [0, 0, w, h], {
+            "bg_rgb": bg_rgb,
+            "bg_hex": _rgb_to_hex(bg_rgb),
+        }
+
+    max_count = max(c["count"] for c in components)
+    keep = []
+    min_keep = max(4, int(max_count * 0.06))
+
+    for c in components:
+        if c["count"] < min_keep:
+            continue
+        keep.append(c)
+
+    if not keep:
+        keep = list(components)
+
+    def comp_score(c):
+        area_score = float(c["count"])
+        center_penalty = c["dist2"] * 0.35
+        border_penalty = 0.0
+        if c["touches_border"]:
+            border_penalty += area_score * 0.25
+        return area_score - center_penalty - border_penalty
+
+    best = max(keep, key=comp_score)
+
+    min_cx, min_cy, bbox_w, bbox_h = best["bbox"]
+    max_cx = min_cx + bbox_w - 1
+    max_cy = min_cy + bbox_h - 1
+
+    x0 = max(0, min_cx * step - pad)
+    y0 = max(0, min_cy * step - pad)
+    x1 = min(w, (max_cx + 1) * step + pad)
+    y1 = min(h, (max_cy + 1) * step + pad)
+
+    x1 = max(x0 + 1, x1)
+    y1 = max(y0 + 1, y1)
+
+    return [x0, y0, x1 - x0, y1 - y0], {
+        "bg_rgb": bg_rgb,
+        "bg_hex": _rgb_to_hex(bg_rgb),
+    }
+
+
+def crop_subject_from_capture(pixmap):
+    if pixmap is None or pixmap.isNull():
+        raise RuntimeError("crop_subject_from_capture 输入图片无效")
+
+    trimmed, trim_meta = trim_pixmap_margins(
+        pixmap,
+        left=MULTIVIEW_VIEWPORT_TRIM_LEFT,
+        top=MULTIVIEW_VIEWPORT_TRIM_TOP,
+        right=MULTIVIEW_VIEWPORT_TRIM_RIGHT,
+        bottom=MULTIVIEW_VIEWPORT_TRIM_BOTTOM
+    )
+
+    crop_rect_in_trimmed, bg_meta = detect_subject_bbox_from_border_floodfill(
+        trimmed,
+        tolerance=MULTIVIEW_SUBJECT_BG_TOLERANCE,
+        padding=MULTIVIEW_SUBJECT_PADDING,
+        sample_step=MULTIVIEW_SUBJECT_SAMPLE_STEP
+    )
+
+    cx, cy, cw, ch = [int(v) for v in crop_rect_in_trimmed]
+    cropped = trimmed.copy(cx, cy, cw, ch)
+
+    trim_rect = trim_meta.get("trim_rect", [0, 0, pixmap.width(), pixmap.height()])
+    final_crop_rect = [
+        int(trim_rect[0]) + cx,
+        int(trim_rect[1]) + cy,
+        cw,
+        ch
+    ]
+
+    return cropped, {
+        "original_capture_size": trim_meta.get("original_size", [pixmap.width(), pixmap.height()]),
+        "trim_rect_in_capture": trim_rect,
+        "crop_rect_in_capture": final_crop_rect,
+        "bg_rgb": bg_meta.get("bg_rgb", [36, 36, 36]),
+        "bg_hex": bg_meta.get("bg_hex", DEFAULT_ATLAS_BG),
+    }
+
+
+def restore_generated_tile_to_capture_canvas(tile_image_or_path, tile_manifest, output_path):
+    if isinstance(tile_image_or_path, QtGui.QImage):
+        tile_image = tile_image_or_path
+    else:
+        tile_image = QtGui.QImage(tile_image_or_path)
+
+    if tile_image.isNull():
+        raise RuntimeError("restore_generated_tile_to_capture_canvas 输入 tile 无效")
+
+    if not isinstance(tile_manifest, dict):
+        raise RuntimeError("tile_manifest 无效")
+
+    original_capture_size = tile_manifest.get("original_capture_size", [])
+    crop_rect_in_capture = tile_manifest.get("crop_rect_in_capture", [])
+    tile_content_rect = tile_manifest.get("tile_content_rect", [])
+    tile_output_size = tile_manifest.get("tile_output_size", [])
+
+    if len(original_capture_size) != 2:
+        raise RuntimeError("tile_manifest 缺少 original_capture_size")
+    if len(crop_rect_in_capture) != 4:
+        raise RuntimeError("tile_manifest 缺少 crop_rect_in_capture")
+
+    orig_w, orig_h = [int(v) for v in original_capture_size]
+    crop_x, crop_y, crop_w, crop_h = [int(v) for v in crop_rect_in_capture]
+
+    if orig_w <= 0 or orig_h <= 0 or crop_w <= 0 or crop_h <= 0:
+        raise RuntimeError("restore 所需尺寸无效")
+
+    content_img = tile_image
+
+    if len(tile_content_rect) == 4 and len(tile_output_size) == 2:
+        tx, ty, tw, th = [int(v) for v in tile_content_rect]
+        ref_tw, ref_th = [int(v) for v in tile_output_size]
+
+        img_w = tile_image.width()
+        img_h = tile_image.height()
+
+        if ref_tw > 0 and ref_th > 0 and img_w > 0 and img_h > 0:
+            sx = float(img_w) / float(ref_tw)
+            sy = float(img_h) / float(ref_th)
+
+            x0 = int(round(tx * sx))
+            y0 = int(round(ty * sy))
+            x1 = int(round((tx + tw) * sx))
+            y1 = int(round((ty + th) * sy))
+
+            x0 = max(0, min(x0, max(img_w - 1, 0)))
+            y0 = max(0, min(y0, max(img_h - 1, 0)))
+            x1 = max(x0 + 1, min(x1, img_w))
+            y1 = max(y0 + 1, min(y1, img_h))
+
+            sub = tile_image.copy(x0, y0, x1 - x0, y1 - y0)
+            if not sub.isNull():
+                content_img = sub
+
+    scaled_pm = QtGui.QPixmap.fromImage(content_img).scaled(
+        crop_w,
+        crop_h,
+        QtCore.Qt.AspectRatioMode.IgnoreAspectRatio,
+        QtCore.Qt.TransformationMode.SmoothTransformation
+    )
+
+    source_capture_path = str(tile_manifest.get("capture_path", "") or "").strip()
+
+    if source_capture_path and os.path.exists(source_capture_path):
+        canvas = load_pixmap_safe(source_capture_path)
+        if canvas.width() != orig_w or canvas.height() != orig_h:
+            fixed = QtGui.QPixmap(orig_w, orig_h)
+            fixed.fill(QtGui.QColor(tile_manifest.get("bg_hex", DEFAULT_ATLAS_BG)))
+            painter = QtGui.QPainter(fixed)
+            try:
+                painter.drawPixmap(0, 0, canvas)
+            finally:
+                painter.end()
+            canvas = fixed
+    else:
+        canvas = QtGui.QPixmap(orig_w, orig_h)
+        canvas.fill(QtGui.QColor(tile_manifest.get("bg_hex", DEFAULT_ATLAS_BG)))
+
+    painter = QtGui.QPainter(canvas)
     try:
-        font = painter.font()
-        font.setPointSize(20)
-        font.setBold(True)
-        painter.setFont(font)
-
-        fm = QtGui.QFontMetrics(font)
-        text_w = fm.horizontalAdvance(text)
-        text_h = fm.height()
-
-        pad_x = 10
-        pad_y = 6
-
-        label_rect = QtCore.QRect(
-            rect.x() + margin,
-            rect.y() + margin,
-            text_w + pad_x * 2,
-            text_h + pad_y * 2
-        )
-
-        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
-
-        painter.setPen(QtCore.Qt.PenStyle.NoPen)
-        painter.setBrush(QtGui.QColor(0, 0, 0, 160))
-        painter.drawRoundedRect(label_rect, 8, 8)
-
-        painter.setPen(QtGui.QColor("#ffffff"))
-        painter.drawText(
-            label_rect.adjusted(pad_x, pad_y, -pad_x, -pad_y),
-            QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter,
-            text
-        )
+        painter.drawPixmap(crop_x, crop_y, scaled_pm)
     finally:
-        painter.restore()
+        painter.end()
+
+    ok = canvas.save(output_path, "PNG")
+    if not ok:
+        raise RuntimeError("保存恢复后的 tile 失败: {}".format(output_path))
+
+    return {
+        "result_path": output_path,
+        "restored_content_rect": [crop_x, crop_y, crop_w, crop_h],
+    }
+
+
+def crop_atlas_to_used_bounds(atlas_pixmap, manifest_tiles, outer_pad=MULTIVIEW_PACK_OUTER_PADDING, bg=DEFAULT_ATLAS_BG):
+    if atlas_pixmap is None or atlas_pixmap.isNull():
+        raise RuntimeError("crop_atlas_to_used_bounds 输入 atlas 无效")
+    if not manifest_tiles:
+        raise RuntimeError("crop_atlas_to_used_bounds manifest_tiles 为空")
+
+    min_x = None
+    min_y = None
+    max_x = None
+    max_y = None
+
+    for tile in manifest_tiles:
+        x = int(tile.get("x", 0))
+        y = int(tile.get("y", 0))
+        w = int(tile.get("w", 0))
+        h = int(tile.get("h", 0))
+        if w <= 0 or h <= 0:
+            continue
+
+        if min_x is None or x < min_x:
+            min_x = x
+        if min_y is None or y < min_y:
+            min_y = y
+        if max_x is None or x + w > max_x:
+            max_x = x + w
+        if max_y is None or y + h > max_y:
+            max_y = y + h
+
+    if min_x is None or min_y is None or max_x is None or max_y is None:
+        raise RuntimeError("无法计算 atlas 使用区域")
+
+    pad = max(0, int(outer_pad))
+
+    crop_x = max(0, min_x - pad)
+    crop_y = max(0, min_y - pad)
+    crop_r = min(atlas_pixmap.width(), max_x + pad)
+    crop_b = min(atlas_pixmap.height(), max_y + pad)
+
+    crop_w = max(1, crop_r - crop_x)
+    crop_h = max(1, crop_b - crop_y)
+
+    cropped = atlas_pixmap.copy(crop_x, crop_y, crop_w, crop_h)
+    if cropped.isNull():
+        raise RuntimeError("atlas 裁切失败")
+
+    shifted_tiles = []
+    for tile in manifest_tiles:
+        t = dict(tile)
+        t["x"] = int(t.get("x", 0)) - crop_x
+        t["y"] = int(t.get("y", 0)) - crop_y
+        shifted_tiles.append(t)
+
+    return cropped, shifted_tiles, {
+        "crop_rect": [crop_x, crop_y, crop_w, crop_h],
+        "atlas_size": [crop_w, crop_h],
+        "bg": bg,
+    }
+
+
+def _compute_capped_scaled_size(crop_w, crop_h, target_row_h, max_upscale=MULTIVIEW_MAX_UPSCALE):
+    crop_w = max(1, int(crop_w))
+    crop_h = max(1, int(crop_h))
+    target_row_h = max(1.0, float(target_row_h))
+    max_upscale = max(0.01, float(max_upscale))
+
+    scale_by_row = target_row_h / float(crop_h)
+    scale = min(scale_by_row, max_upscale)
+
+    sw = max(1, int(round(crop_w * scale)))
+    sh = max(1, int(round(crop_h * scale)))
+
+    return sw, sh, scale
+
+
+def build_row_height_layout(crop_records, canvas_w, canvas_h):
+    canvas_w = max(1, int(canvas_w))
+    canvas_h = max(1, int(canvas_h))
+
+    count = len(crop_records)
+    if count <= 0:
+        return []
+
+    pad = int(MULTIVIEW_PACK_OUTER_PADDING)
+    gap = int(MULTIVIEW_PACK_GAP)
+
+    usable_w = max(1, canvas_w - pad * 2)
+    usable_h = max(1, canvas_h - pad * 2)
+
+    if count == 4:
+        row_sizes = [2, 2]
+    elif count == 6:
+        row_sizes = [3, 3]
+    else:
+        cols = 2 if count <= 4 else 3
+        rows = int(math.ceil(float(count) / float(cols)))
+
+        target_row_h = max(1, int((usable_h - gap * (rows - 1)) / max(1, rows)))
+
+        placements = []
+        idx = 0
+        y = pad
+
+        for r in range(rows):
+            row_items = crop_records[idx: idx + cols]
+            idx += cols
+
+            scaled_items = []
+            row_w = 0
+            row_h = 0
+
+            for rec in row_items:
+                sw, sh, _ = _compute_capped_scaled_size(
+                    rec["crop_w"], rec["crop_h"], target_row_h, max_upscale=MULTIVIEW_MAX_UPSCALE
+                )
+                scaled_items.append((rec, sw, sh))
+                row_w += sw
+                row_h = max(row_h, sh)
+
+            row_w += gap * max(0, len(scaled_items) - 1)
+            x = pad + int(round((usable_w - row_w) * 0.5))
+
+            for rec, sw, sh in scaled_items:
+                draw_y = y + int(round((row_h - sh) * 0.5))
+                placements.append({
+                    "record_ref": rec,
+                    "slot_name": str(rec.get("record", {}).get("slot_name", "") or "").strip().lower(),
+                    "cell_rect": [x, y, sw, row_h],
+                    "draw_rect": [x, draw_y, sw, sh],
+                })
+                x += sw + gap
+
+            y += row_h + gap
+
+        return placements
+
+    upper = float(usable_h - gap) / 2.0
+    upper = max(1.0, upper)
+
+    def build_candidate_layout(target_row_h):
+        scaled = []
+        for idx, rec in enumerate(crop_records):
+            sw, sh, sc = _compute_capped_scaled_size(
+                rec["crop_w"], rec["crop_h"], target_row_h, max_upscale=MULTIVIEW_MAX_UPSCALE
+            )
+            scaled.append({
+                "idx": idx,
+                "rec": rec,
+                "w": sw,
+                "h": sh,
+                "scale": sc,
+            })
+
+        n = len(scaled)
+        first_row_count = row_sizes[0]
+
+        best = None
+        best_score = None
+
+        all_indices = list(range(n))
+
+        for comb in combinations(all_indices, first_row_count):
+            row1_idx = set(comb)
+            row2_idx = [i for i in all_indices if i not in row1_idx]
+
+            row1 = [scaled[i] for i in comb]
+            row2 = [scaled[i] for i in row2_idx]
+
+            row1.sort(key=lambda x: x["w"], reverse=True)
+            row2.sort(key=lambda x: x["w"], reverse=True)
+
+            row1_w = sum(it["w"] for it in row1) + gap * max(0, len(row1) - 1)
+            row2_w = sum(it["w"] for it in row2) + gap * max(0, len(row2) - 1)
+
+            row1_h = max((it["h"] for it in row1), default=1)
+            row2_h = max((it["h"] for it in row2), default=1)
+
+            total_h = row1_h + gap + row2_h
+            max_row_w = max(row1_w, row2_w)
+
+            fits = (max_row_w <= usable_w and total_h <= usable_h)
+            if not fits:
+                continue
+
+            width_balance = abs(row1_w - row2_w)
+            total_area = max_row_w * total_h
+            content_area = sum(it["w"] * it["h"] for it in row1) + sum(it["w"] * it["h"] for it in row2)
+            waste = total_area - content_area
+
+            score = (
+                width_balance,
+                waste,
+                total_area
+            )
+
+            if best is None or score < best_score:
+                best = {
+                    "row1": row1,
+                    "row2": row2,
+                    "row1_w": row1_w,
+                    "row2_w": row2_w,
+                    "row1_h": row1_h,
+                    "row2_h": row2_h,
+                    "total_h": total_h,
+                    "max_row_w": max_row_w,
+                }
+                best_score = score
+
+        return best
+
+    lo = 1.0
+    hi = upper
+    best_layout = None
+
+    for _ in range(28):
+        mid = (lo + hi) * 0.5
+        candidate = build_candidate_layout(mid)
+        if candidate is not None:
+            best_layout = candidate
+            lo = mid
+        else:
+            hi = mid
+
+    if best_layout is None:
+        best_layout = build_candidate_layout(1.0)
+
+    if best_layout is None:
+        return []
+
+    placements = []
+
+    start_y = pad + int(round((usable_h - best_layout["total_h"]) * 0.5))
+
+    y1 = start_y
+    x1 = pad + int(round((usable_w - best_layout["row1_w"]) * 0.5))
+    for it in best_layout["row1"]:
+        draw_y = y1 + int(round((best_layout["row1_h"] - it["h"]) * 0.5))
+        placements.append({
+            "record_ref": it["rec"],
+            "slot_name": str(it["rec"].get("record", {}).get("slot_name", "") or "").strip().lower(),
+            "cell_rect": [x1, y1, it["w"], best_layout["row1_h"]],
+            "draw_rect": [x1, draw_y, it["w"], it["h"]],
+        })
+        x1 += it["w"] + gap
+
+    y2 = y1 + best_layout["row1_h"] + gap
+    x2 = pad + int(round((usable_w - best_layout["row2_w"]) * 0.5))
+    for it in best_layout["row2"]:
+        draw_y = y2 + int(round((best_layout["row2_h"] - it["h"]) * 0.5))
+        placements.append({
+            "record_ref": it["rec"],
+            "slot_name": str(it["rec"].get("record", {}).get("slot_name", "") or "").strip().lower(),
+            "cell_rect": [x2, y2, it["w"], best_layout["row2_h"]],
+            "draw_rect": [x2, draw_y, it["w"], it["h"]],
+        })
+        x2 += it["w"] + gap
+
+    return placements
+
+
+def render_row_height_atlas(placements, atlas_w, atlas_h):
+    atlas = QtGui.QPixmap(int(atlas_w), int(atlas_h))
+    atlas.fill(QtGui.QColor(DEFAULT_ATLAS_BG))
+
+    manifest_tiles = []
+
+    painter = QtGui.QPainter(atlas)
+    try:
+        for idx, placement in enumerate(placements):
+            rec = placement.get("record_ref") or {}
+            draw_rect = placement.get("draw_rect") or [0, 0, 1, 1]
+            x, y, w, h = [int(v) for v in draw_rect]
+
+            cropped_pixmap = rec.get("cropped_pixmap")
+            if cropped_pixmap is None or cropped_pixmap.isNull():
+                continue
+
+            scaled_pm = cropped_pixmap.scaled(
+                w,
+                h,
+                QtCore.Qt.AspectRatioMode.IgnoreAspectRatio,
+                QtCore.Qt.TransformationMode.SmoothTransformation
+            )
+            painter.drawPixmap(x, y, scaled_pm)
+
+            src_rec = rec.get("record") or {}
+            crop_meta = rec.get("crop_meta") or {}
+
+            manifest_tiles.append({
+                "index": idx,
+                "slot_name": src_rec.get("slot_name"),
+                "slot_label": src_rec.get("slot_label"),
+                "x": x,
+                "y": y,
+                "w": w,
+                "h": h,
+                "capture_path": src_rec.get("capture_path"),
+                "camera_state": src_rec.get("camera_state"),
+                "time": src_rec.get("time"),
+
+                "fit_mode": "subject_crop_row_height_layout",
+                "source_size": crop_meta.get("original_capture_size"),
+                "original_capture_size": crop_meta.get("original_capture_size"),
+                "trim_rect_in_capture": crop_meta.get("trim_rect_in_capture"),
+                "crop_rect_in_capture": crop_meta.get("crop_rect_in_capture"),
+                "tile_content_rect": [0, 0, w, h],
+                "tile_output_size": [w, h],
+                "packed_rect": [x, y, w, h],
+                "cropped_source_size": [rec.get("crop_w", 1), rec.get("crop_h", 1)],
+                "bg_rgb": crop_meta.get("bg_rgb"),
+                "bg_hex": crop_meta.get("bg_hex", DEFAULT_ATLAS_BG),
+            })
+    finally:
+        painter.end()
+
+    return atlas, manifest_tiles
 
 
 def build_multiview_atlas(tile_records, atlas_path, tile_size=DEFAULT_MULTI_TILE_SIZE):
@@ -720,97 +1335,79 @@ def build_multiview_atlas(tile_records, atlas_path, tile_size=DEFAULT_MULTI_TILE
         raise RuntimeError("tile_records 为空")
 
     count = len(tile_records)
-    cols, rows = (2, 2) if count <= 4 else (3, 2)
 
-    tile_w = int(tile_size)
-    tile_h = int(tile_size)
+    atlas_side = MULTIVIEW_PACK_SIDE_4 if count <= 4 else MULTIVIEW_PACK_SIDE_6
+    atlas_side = max(512, int(atlas_side))
 
-    atlas_w = cols * tile_w
-    atlas_h = rows * tile_h
+    crop_records = []
 
-    atlas = QtGui.QPixmap(atlas_w, atlas_h)
-    atlas.fill(QtGui.QColor(DEFAULT_ATLAS_BG))
+    for idx, rec in enumerate(tile_records):
+        src = load_pixmap_safe(rec["capture_path"])
+        src_w = src.width()
+        src_h = src.height()
+        if src_w <= 0 or src_h <= 0:
+            raise RuntimeError("输入截图尺寸无效: {}".format(rec["capture_path"]))
 
-    manifest_tiles = []
+        cropped, crop_meta = crop_subject_from_capture(src)
 
-    painter = QtGui.QPainter(atlas)
-    try:
-        for idx, rec in enumerate(tile_records):
-            x = (idx % cols) * tile_w
-            y = (idx // cols) * tile_h
+        crop_w = cropped.width()
+        crop_h = cropped.height()
+        if crop_w <= 0 or crop_h <= 0:
+            raise RuntimeError("主体裁剪结果无效: {}".format(rec["capture_path"]))
 
-            src = load_pixmap_safe(rec["capture_path"])
+        crop_records.append({
+            "index": idx,
+            "record": rec,
+            "cropped_pixmap": cropped,
+            "crop_w": crop_w,
+            "crop_h": crop_h,
+            "crop_meta": crop_meta,
+        })
 
-            src_w = src.width()
-            src_h = src.height()
-            if src_w <= 0 or src_h <= 0:
-                raise RuntimeError("输入截图尺寸无效: {}".format(rec["capture_path"]))
+    placements = build_row_height_layout(
+        crop_records=crop_records,
+        canvas_w=atlas_side,
+        canvas_h=atlas_side
+    )
 
-            scale = float(tile_h) / float(src_h)
-            scaled_w = max(1, int(round(src_w * scale)))
-            scaled_h = tile_h
+    if not placements:
+        raise RuntimeError("多视角行高布局失败")
 
-            fitted = fit_pixmap_height_locked(src, tile_w, tile_h, bg=DEFAULT_ATLAS_BG)
-            painter.drawPixmap(x, y, fitted)
+    atlas, manifest_tiles = render_row_height_atlas(
+        placements=placements,
+        atlas_w=atlas_side,
+        atlas_h=atlas_side
+    )
 
-            tile_rect = QtCore.QRect(x, y, tile_w, tile_h)
-            label_text = rec.get("slot_label") or rec.get("slot_name") or ""
-            draw_corner_label(painter, tile_rect, label_text)
+    cropped_atlas, shifted_tiles, crop_info = crop_atlas_to_used_bounds(
+        atlas_pixmap=atlas,
+        manifest_tiles=manifest_tiles,
+        outer_pad=MULTIVIEW_PACK_OUTER_PADDING,
+        bg=DEFAULT_ATLAS_BG
+    )
 
-            if scaled_w > tile_w:
-                content_rect = [0, 0, tile_w, tile_h]
-                placement_mode = "crop_x"
-                crop_left = int(round((scaled_w - tile_w) * 0.5))
-                crop_right = max(0, scaled_w - tile_w - crop_left)
-                pad_left = 0
-                pad_right = 0
-            else:
-                pad_left = int(round((tile_w - scaled_w) * 0.5))
-                pad_right = max(0, tile_w - scaled_w - pad_left)
-                content_rect = [pad_left, 0, scaled_w, tile_h]
-                placement_mode = "pad_x"
-                crop_left = 0
-                crop_right = 0
-
-            manifest_tiles.append({
-                "index": idx,
-                "slot_name": rec.get("slot_name"),
-                "slot_label": rec.get("slot_label"),
-                "x": x,
-                "y": y,
-                "w": tile_w,
-                "h": tile_h,
-                "capture_path": rec.get("capture_path"),
-                "camera_state": rec.get("camera_state"),
-                "time": rec.get("time"),
-
-                "fit_mode": "height_locked",
-                "source_size": [src_w, src_h],
-                "scaled_size": [scaled_w, scaled_h],
-                "content_rect": content_rect,
-                "placement_mode": placement_mode,
-                "pad_left": pad_left,
-                "pad_right": pad_right,
-                "crop_left": crop_left,
-                "crop_right": crop_right,
-            })
-    finally:
-        painter.end()
-
-    ok = atlas.save(atlas_path, "PNG")
+    ok = cropped_atlas.save(atlas_path, "PNG")
     if not ok:
         raise RuntimeError("保存多视角拼图失败: {}".format(atlas_path))
+
+    layout_mode = "row_height_4" if count <= 4 else "row_height_6"
 
     manifest = {
         "type": "multiview_manifest",
         "time": now_str_readable(),
         "atlas_path": atlas_path,
-        "tile_width": tile_w,
-        "tile_height": tile_h,
-        "cols": cols,
-        "rows": rows,
-        "fit_mode": "height_locked",
-        "tiles": manifest_tiles,
+        "atlas_size": crop_info.get("atlas_size", [cropped_atlas.width(), cropped_atlas.height()]),
+        "atlas_crop_rect_from_pack_canvas": crop_info.get(
+            "crop_rect",
+            [0, 0, cropped_atlas.width(), cropped_atlas.height()]
+        ),
+        "tile_width": 0,
+        "tile_height": 0,
+        "cols": 0,
+        "rows": 0,
+        "fit_mode": "subject_crop_row_height_layout",
+        "layout_mode": layout_mode,
+        "tiles": shifted_tiles,
     }
     return manifest
 
@@ -832,16 +1429,13 @@ def split_multiview_result_by_manifest(result_image_path, manifest, output_dir):
     src_atlas_path = manifest.get("atlas_path", "")
     src_atlas = QtGui.QImage(src_atlas_path) if src_atlas_path and os.path.exists(src_atlas_path) else QtGui.QImage()
 
-    manifest_tile_w = int(manifest.get("tile_width", 0))
-    manifest_tile_h = int(manifest.get("tile_height", 0))
-    manifest_cols = int(manifest.get("cols", 0))
-    manifest_rows = int(manifest.get("rows", 0))
-
-    if not manifest_tile_w or not manifest_tile_h or not manifest_cols or not manifest_rows:
-        raise RuntimeError("manifest 缺少 tile/cols/rows 信息")
-
-    expected_src_w = manifest_tile_w * manifest_cols
-    expected_src_h = manifest_tile_h * manifest_rows
+    atlas_size = manifest.get("atlas_size", [])
+    if len(atlas_size) == 2:
+        expected_src_w = int(atlas_size[0])
+        expected_src_h = int(atlas_size[1])
+    else:
+        expected_src_w = image.width()
+        expected_src_h = image.height()
 
     if not src_atlas.isNull():
         src_w = src_atlas.width()
@@ -860,9 +1454,11 @@ def split_multiview_result_by_manifest(result_image_path, manifest, output_dir):
     scale_y = float(dst_h) / float(src_h)
 
     out_records = []
+    base_name = os.path.splitext(os.path.basename(result_image_path))[0]
 
     for tile in tiles:
         slot_name = tile.get("slot_name", "tile")
+
         src_x = int(tile.get("x", 0))
         src_y = int(tile.get("y", 0))
         src_tw = int(tile.get("w", 0))
@@ -878,30 +1474,34 @@ def split_multiview_result_by_manifest(result_image_path, manifest, output_dir):
         x1 = max(x0 + 1, min(x1, dst_w))
         y1 = max(y0 + 1, min(y1, dst_h))
 
-        sub_w = x1 - x0
-        sub_h = y1 - y0
-
-        sub = image.copy(x0, y0, sub_w, sub_h)
+        sub = image.copy(x0, y0, x1 - x0, y1 - y0)
         if sub.isNull():
             continue
 
-        base_name = os.path.splitext(os.path.basename(result_image_path))[0]
-        save_path = os.path.join(output_dir, "{}_{}.png".format(base_name, slot_name))
-        ok = sub.save(save_path, "PNG")
+        raw_tile_path = os.path.join(output_dir, "{}_{}_raw.png".format(base_name, slot_name))
+        ok = sub.save(raw_tile_path, "PNG")
         if not ok:
-            raise RuntimeError("保存切图失败: {}".format(save_path))
+            raise RuntimeError("保存原始切图失败: {}".format(raw_tile_path))
+
+        restored_path = os.path.join(output_dir, "{}_{}.png".format(base_name, slot_name))
+        restore_info = restore_generated_tile_to_capture_canvas(
+            tile_image_or_path=raw_tile_path,
+            tile_manifest=tile,
+            output_path=restored_path
+        )
 
         out_records.append({
             "slot_name": slot_name,
             "slot_label": tile.get("slot_label", slot_name),
-            "result_path": save_path,
+            "result_path": restored_path,
+            "raw_tile_path": raw_tile_path,
             "camera_state": tile.get("camera_state"),
             "source_capture_path": tile.get("capture_path"),
             "crop_src_rect": [src_x, src_y, src_tw, src_th],
-            "crop_scaled_rect": [x0, y0, sub_w, sub_h],
+            "crop_scaled_rect": [x0, y0, x1 - x0, y1 - y0],
+            "restored_content_rect": restore_info.get("restored_content_rect"),
         })
 
-    base_name = os.path.splitext(os.path.basename(result_image_path))[0]
     split_manifest_path = os.path.join(output_dir, "{}_split_manifest.json".format(base_name))
     write_json(split_manifest_path, {
         "type": "multiview_split",
@@ -926,10 +1526,25 @@ def build_uvguide_composite_from_pixmaps(multiview_atlas_path, uv_pixmap, output
 
     atlas = load_pixmap_safe(multiview_atlas_path)
 
-    left = fit_pixmap_to_canvas(atlas, panel_size, panel_size, bg="#000000")
+    atlas_w = atlas.width()
+    atlas_h = atlas.height()
+    if atlas_w <= 0 or atlas_h <= 0:
+        raise RuntimeError("多视角 atlas 尺寸无效")
+
+    left_scale = float(panel_size) / float(atlas_h)
+    left_w = max(1, int(round(atlas_w * left_scale)))
+    left_h = int(panel_size)
+
+    left = atlas.scaled(
+        left_w,
+        left_h,
+        QtCore.Qt.AspectRatioMode.IgnoreAspectRatio,
+        QtCore.Qt.TransformationMode.SmoothTransformation
+    )
+
     right = fit_pixmap_to_canvas(uv_pixmap, panel_size, panel_size, bg="#101010")
 
-    canvas_w = panel_size * 2 + gap
+    canvas_w = left_w + gap + panel_size
     canvas_h = panel_size
 
     canvas = QtGui.QPixmap(canvas_w, canvas_h)
@@ -938,12 +1553,12 @@ def build_uvguide_composite_from_pixmaps(multiview_atlas_path, uv_pixmap, output
     painter = QtGui.QPainter(canvas)
     try:
         painter.drawPixmap(0, 0, left)
-        painter.drawPixmap(panel_size + gap, 0, right)
+        painter.drawPixmap(left_w + gap, 0, right)
 
         pen = QtGui.QPen(QtGui.QColor("#404040"))
         pen.setWidth(2)
         painter.setPen(pen)
-        painter.drawLine(panel_size + int(gap / 2), 0, panel_size + int(gap / 2), canvas_h)
+        painter.drawLine(left_w + int(gap / 2), 0, left_w + int(gap / 2), canvas_h)
 
         font = painter.font()
         font.setPointSize(18)
@@ -952,7 +1567,7 @@ def build_uvguide_composite_from_pixmaps(multiview_atlas_path, uv_pixmap, output
 
         painter.setPen(QtGui.QColor("#d0d0d0"))
         painter.drawText(
-            QtCore.QRect(panel_size + gap + 12, 8, panel_size - 24, 32),
+            QtCore.QRect(left_w + gap + 12, 8, panel_size - 24, 32),
             QtCore.Qt.AlignmentFlag.AlignLeft,
             "UV"
         )
@@ -969,11 +1584,18 @@ def build_uvguide_composite_from_pixmaps(multiview_atlas_path, uv_pixmap, output
         "time": now_str_readable(),
         "composite_path": output_path,
         "canvas_size": [canvas_w, canvas_h],
-        "views_rect": [0, 0, panel_size, panel_size],
-        "uv_rect": [panel_size + gap, 0, panel_size, panel_size],
+
+        "views_rect": [0, 0, left_w, panel_size],
+
+        "uv_rect": [left_w + gap, 0, panel_size, panel_size],
+
         "panel_size": panel_size,
         "gap": gap,
         "multiview_atlas_path": multiview_atlas_path,
+
+        "left_scaled_size": [left_w, left_h],
+        "right_panel_size": [panel_size, panel_size],
+        "source_atlas_size": [atlas_w, atlas_h],
     }
 
 
@@ -1495,8 +2117,11 @@ class RunningHubClient(object):
 
     def _map_aspect_ratio(self, aspect_ratio):
         text = str(aspect_ratio or "").strip().lower()
-        if not text or text == "auto":
-            return "1:1"
+        if not text:
+            return "auto"
+
+        if text == "auto":
+            return "auto"
 
         mapping = {
             "1:1": "1:1",
@@ -1514,7 +2139,7 @@ class RunningHubClient(object):
             "1:8": "1:8",
             "8:1": "8:1",
         }
-        return mapping.get(text, "1:1")
+        return mapping.get(text, "auto")
 
     def _map_resolution(self, image_size):
         text = str(image_size or "").strip().lower()
@@ -3463,6 +4088,23 @@ class AIGenPanel(QtWidgets.QWidget):
         if safe_remove(composite_result):
             removed.append(composite_result)
 
+        raw_tile = record.get("raw_tile_path")
+        if safe_remove(raw_tile):
+            removed.append(raw_tile)
+
+        if record.get("type") == "result" and (
+                record.get("mode") == MODE_MULTI or record.get("is_multiview_result")
+        ):
+            rp = record.get("result_path", "")
+            if rp:
+                split_dir = os.path.splitext(rp)[0] + "_tiles"
+                if os.path.isdir(split_dir):
+                    try:
+                        shutil.rmtree(split_dir, ignore_errors=True)
+                        removed.append(split_dir)
+                    except Exception:
+                        pass
+
         return removed
 
     def delete_record(self, list_widget, item):
@@ -4363,7 +5005,7 @@ class AIGenPanel(QtWidgets.QWidget):
         prompt = prompt_override if prompt_override is not None else user_prompt
 
         model = self.model_combo.currentText().strip()
-        aspect_ratio = DEFAULT_ASPECT_RATIO
+        aspect_ratio = "auto"
         image_size = self.size_combo.currentText().strip()
         output_dir = self.current_output_dir(create=True)
 
@@ -4583,11 +5225,14 @@ class AIGenPanel(QtWidgets.QWidget):
                     raise RuntimeError("UV manifest 不存在")
 
                 self.log("UV 模式生成")
+                self.log("UV 输入尺寸: {}x{}".format(*get_image_size_safe(capture_path)))
+                self.log("UV 比例策略: auto")
 
                 ctx = {
                     "mode": MODE_UV_GUIDE,
                     "uvguide_manifest": manifest
                 }
+
                 self.start_background_generate(
                     capture_path=capture_path,
                     camera_state=None,
@@ -4628,10 +5273,13 @@ class AIGenPanel(QtWidgets.QWidget):
                     raise RuntimeError("多视角 manifest 不存在")
 
                 self.log("多视角模式生成")
+                self.log("多视角输入尺寸: {}x{}".format(*get_image_size_safe(capture_path)))
+                self.log("多视角比例策略: auto")
 
                 ctx = {
                     "mode": MODE_MULTI
                 }
+
                 self.start_background_generate(
                     capture_path=capture_path,
                     camera_state=None,
