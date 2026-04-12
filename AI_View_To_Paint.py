@@ -983,8 +983,15 @@ def build_single_ref_composite_from_pixmaps(main_pixmap, ref_pixmap, output_path
     if ref_pixmap is None or ref_pixmap.isNull():
         raise RuntimeError("参考图 pixmap 无效")
 
-    left = normalize_square_height_locked(ref_pixmap, panel_size, bg=DEFAULT_ATLAS_BG)
-    right = normalize_square_height_locked(main_pixmap, panel_size, bg=DEFAULT_ATLAS_BG)
+    if main_pixmap.width() != panel_size or main_pixmap.height() != panel_size:
+        right = fit_pixmap_to_canvas(main_pixmap, panel_size, panel_size, bg=DEFAULT_ATLAS_BG)
+    else:
+        right = main_pixmap
+
+    if ref_pixmap.width() != panel_size or ref_pixmap.height() != panel_size:
+        left = fit_pixmap_to_canvas(ref_pixmap, panel_size, panel_size, bg=DEFAULT_ATLAS_BG)
+    else:
+        left = ref_pixmap
 
     canvas_w = panel_size * 2 + gap
     canvas_h = panel_size
@@ -1034,9 +1041,8 @@ def build_single_ref_composite_from_pixmaps(main_pixmap, ref_pixmap, output_path
         "main_rect": [panel_size + gap, 0, panel_size, panel_size],
         "panel_size": panel_size,
         "gap": gap,
-        "fit_mode": "height_locked_square",
+        "fit_mode": "pre_normalized_square",
     }
-
 
 def split_single_ref_result_by_manifest(result_image_path, manifest, output_path, crop_key="main_rect"):
     if not isinstance(manifest, dict):
@@ -4695,20 +4701,42 @@ class AIGenPanel(QtWidgets.QWidget):
             if record.get("is_single_ref_result") and record.get("single_ref_manifest"):
                 try:
                     full_result_path = result_path
-                    main_result_path = os.path.splitext(full_result_path)[0] + "_main.png"
+                    main_panel_path = os.path.splitext(full_result_path)[0] + "_mainpanel.png"
 
                     crop_info = split_single_ref_result_by_manifest(
                         result_image_path=full_result_path,
                         manifest=record.get("single_ref_manifest"),
-                        output_path=main_result_path,
+                        output_path=main_panel_path,
                         crop_key="main_rect"
                     )
 
+                    final_result_path = crop_info["result_path"]
+
+                    single_view_manifest = record.get("single_view_manifest")
+                    if single_view_manifest:
+                        try:
+                            main_result_path = os.path.splitext(full_result_path)[0] + "_main.png"
+
+                            crop_info2 = split_single_result_by_manifest(
+                                result_image_path=main_panel_path,
+                                manifest=single_view_manifest,
+                                output_path=main_result_path
+                            )
+
+                            final_result_path = crop_info2["result_path"]
+
+                            if normalize_path_str(main_panel_path) != normalize_path_str(final_result_path):
+                                safe_remove(main_panel_path)
+
+                        except Exception as e:
+                            self.log("单视图参考内部内容裁切失败，保留右侧主面板结果: {}".format(e))
+
                     record["composite_result_path"] = full_result_path
-                    record["result_path"] = crop_info["result_path"]
-                    self.last_result_path = record["result_path"]
+                    record["result_path"] = final_result_path
+                    self.last_result_path = final_result_path
                     write_json(record["meta_path"], record)
-                    result_path = record["result_path"]
+                    result_path = final_result_path
+
                 except Exception as e:
                     self.log("单视图参考结果裁切失败，保留整图结果: {}".format(e))
 
