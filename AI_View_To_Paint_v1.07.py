@@ -3186,6 +3186,7 @@ class AIGenPanel(QtWidgets.QWidget):
         self.settings_btn.clicked.connect(self.on_settings_clicked)
         self.open_dir_btn.clicked.connect(self.on_open_dir_clicked)
         self.output_dir_edit.editingFinished.connect(self.on_output_dir_changed)
+        self.size_combo.currentTextChanged.connect(self.on_image_size_changed)
 
         self.capture_list.itemDoubleClicked.connect(self.on_capture_item_double_clicked)
         self.result_list.itemDoubleClicked.connect(self.on_result_item_double_clicked)
@@ -6034,6 +6035,12 @@ class AIGenPanel(QtWidgets.QWidget):
         self.persist_output_dir_setting()
         self.clear_preview()
         self.reload_galleries(log_message=True)
+
+    def on_image_size_changed(self, text):
+        self.settings_data = merge_plugin_settings(dict(self.settings_data, **{
+            "default_image_size": (text or "").strip() or DEFAULT_IMAGE_SIZE
+        }))
+        save_plugin_settings(self.settings_data)
 
     def cleanup(self):
         self.gen_cancel_requested = True
