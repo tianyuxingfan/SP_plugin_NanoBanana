@@ -52,7 +52,7 @@ RESULT_PATH = "/v1/draw/result"
 
 DEFAULT_MODEL = "nano-banana-2"
 DEFAULT_ASPECT_RATIO = "auto"
-DEFAULT_IMAGE_SIZE = "1K"
+DEFAULT_IMAGE_SIZE = "2K"
 
 DEFAULT_POLL_INTERVAL = 1.5
 DEFAULT_POLL_TIMEOUT = 300
@@ -147,22 +147,32 @@ DEFAULT_MULTI_REF_PROMPT = """参考输入中的参考图风格与材质表现�
 
 材质指定："""
 
-DEFAULT_UV_GUIDE_PROMPT = """根据输入的模型视角控制信息与UV定位信息生成最终UV贴图。
+DEFAULT_UV_GUIDE_PROMPT = """根据输入图生成最终UV贴图。
+
+输入说明：
+1. 第一张图是UV布局图
+2. 第二张图是模型四视角参考图，用于判断部位与UV区域的对应关系
 
 要求：
-1. 当前颜色仅用于表示位置和对应关系，不代表最终颜色
-2. 最终输出应严格遵守UV区域与布局
-3. 不要输出模型视角预览内容，只输出最终UV贴图区域
+1. 严格保持UV区域、边界、布局与留白不变
+2. 根据四视角参考图，将正确的颜色、材质和结构放到对应UV区域
+3. 保证前后左右映射关系准确，不要错位、颠倒或混乱
+4. 输入图中的颜色仅用于定位，不代表最终颜色
 
 材质指定："""
 
-DEFAULT_UV_GUIDE_REF_PROMPT = """参考输入中的参考图风格与材质表现，并根据模型视角控制信息与UV定位信息生成最终UV贴图。
+DEFAULT_UV_GUIDE_REF_PROMPT = """根据输入图生成最终UV贴图，并参考附加参考图的材质、风格与细节表现。
+
+输入说明：
+1. 第一张图是UV布局图，决定最终输出的区域、边界与排布
+2. 第二张图是模型四视角参考图，用于判断各部位与UV区域的对应关系
+3. 其余参考图用于提供材质、配色、风格与细节参考
 
 要求：
-1. 当前颜色仅用于表示位置和对应关系，不代表最终颜色
-2. 最终输出应严格遵守UV区域与布局
-3. 不要输出模型视角预览内容，只输出最终UV贴图区域
-4. 参考参考图的材质、配色与细节风格
+1. 严格保持UV区域、边界、布局与留白不变
+2. 根据四视角参考图，将正确的颜色、材质和结构放到对应UV区域
+3. 在不破坏UV布局和映射关系的前提下，参考附加参考图的材质、配色与风格
+4. 输入图中的颜色仅用于定位，不代表最终颜色
 
 材质指定："""
 
@@ -291,11 +301,14 @@ def get_image_size_safe(image_path):
         pass
     return 0, 0
 
+
 def plugin_settings_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
+
 def plugin_settings_path():
     return os.path.join(plugin_settings_dir(), "AI_View_To_Paint.json")
+
 
 def merge_plugin_settings(data=None):
     settings = dict(DEFAULT_SETTINGS)
@@ -1552,87 +1565,6 @@ def split_multiview_result_by_manifest(result_image_path, manifest, output_dir):
     return out_records, split_manifest_path
 
 
-def build_uvguide_composite_from_pixmaps(multiview_atlas_path, uv_pixmap, output_path, panel_size=2048, gap=32):
-    if not os.path.exists(multiview_atlas_path):
-        raise RuntimeError("多视角 atlas 不存在: {}".format(multiview_atlas_path))
-    if uv_pixmap is None or uv_pixmap.isNull():
-        raise RuntimeError("UV pixmap 无效")
-
-    atlas = load_pixmap_safe(multiview_atlas_path)
-
-    atlas_w = atlas.width()
-    atlas_h = atlas.height()
-    if atlas_w <= 0 or atlas_h <= 0:
-        raise RuntimeError("多视角 atlas 尺寸无效")
-
-    left_scale = float(panel_size) / float(atlas_h)
-    left_w = max(1, int(round(atlas_w * left_scale)))
-    left_h = int(panel_size)
-
-    left = atlas.scaled(
-        left_w,
-        left_h,
-        QtCore.Qt.AspectRatioMode.IgnoreAspectRatio,
-        QtCore.Qt.TransformationMode.SmoothTransformation
-    )
-
-    right = fit_pixmap_to_canvas(uv_pixmap, panel_size, panel_size, bg="#101010")
-
-    canvas_w = left_w + gap + panel_size
-    canvas_h = panel_size
-
-    canvas = QtGui.QPixmap(canvas_w, canvas_h)
-    canvas.fill(QtGui.QColor("#000000"))
-
-    painter = QtGui.QPainter(canvas)
-    try:
-        painter.drawPixmap(0, 0, left)
-        painter.drawPixmap(left_w + gap, 0, right)
-
-        pen = QtGui.QPen(QtGui.QColor("#404040"))
-        pen.setWidth(2)
-        painter.setPen(pen)
-        painter.drawLine(left_w + int(gap / 2), 0, left_w + int(gap / 2), canvas_h)
-
-        font = painter.font()
-        font.setPointSize(18)
-        font.setBold(True)
-        painter.setFont(font)
-
-        painter.setPen(QtGui.QColor("#d0d0d0"))
-        painter.drawText(
-            QtCore.QRect(left_w + gap + 12, 8, panel_size - 24, 32),
-            QtCore.Qt.AlignmentFlag.AlignLeft,
-            "UV"
-        )
-
-    finally:
-        painter.end()
-
-    ok = canvas.save(output_path, "PNG")
-    if not ok:
-        raise RuntimeError("保存 UV composite 失败: {}".format(output_path))
-
-    return {
-        "type": "uv_auto_manifest",
-        "time": now_str_readable(),
-        "composite_path": output_path,
-        "canvas_size": [canvas_w, canvas_h],
-
-        "views_rect": [0, 0, left_w, panel_size],
-
-        "uv_rect": [left_w + gap, 0, panel_size, panel_size],
-
-        "panel_size": panel_size,
-        "gap": gap,
-        "multiview_atlas_path": multiview_atlas_path,
-
-        "left_scaled_size": [left_w, left_h],
-        "right_panel_size": [panel_size, panel_size],
-        "source_atlas_size": [atlas_w, atlas_h],
-    }
-
-
 def split_single_result_by_manifest(result_image_path, manifest, output_path):
     if not isinstance(manifest, dict):
         raise RuntimeError("single_view manifest 无效")
@@ -1676,57 +1608,6 @@ def split_single_result_by_manifest(result_image_path, manifest, output_path):
     ok = sub.save(output_path, "PNG")
     if not ok:
         raise RuntimeError("保存单视角裁切图失败: {}".format(output_path))
-
-    return {
-        "result_path": output_path,
-        "crop_scaled_rect": [x0, y0, x1 - x0, y1 - y0],
-        "source_result_path": result_image_path,
-    }
-
-
-def split_uvguide_result_by_manifest(result_image_path, manifest, output_path):
-    if not isinstance(manifest, dict):
-        raise RuntimeError("uvguide manifest 无效")
-
-    image = QtGui.QImage(result_image_path)
-    if image.isNull():
-        raise RuntimeError("无法读取结果图: {}".format(result_image_path))
-
-    canvas_size = manifest.get("canvas_size", [])
-    uv_rect = manifest.get("uv_rect", [])
-
-    if len(canvas_size) != 2 or len(uv_rect) != 4:
-        raise RuntimeError("uvguide manifest 缺少 canvas_size / uv_rect")
-
-    src_w, src_h = int(canvas_size[0]), int(canvas_size[1])
-    uv_x, uv_y, uv_w, uv_h = [int(v) for v in uv_rect]
-
-    dst_w = image.width()
-    dst_h = image.height()
-
-    if src_w <= 0 or src_h <= 0 or dst_w <= 0 or dst_h <= 0:
-        raise RuntimeError("UV 结果尺寸无效")
-
-    scale_x = float(dst_w) / float(src_w)
-    scale_y = float(dst_h) / float(src_h)
-
-    x0 = int(round(uv_x * scale_x))
-    y0 = int(round(uv_y * scale_y))
-    x1 = int(round((uv_x + uv_w) * scale_x))
-    y1 = int(round((uv_y + uv_h) * scale_y))
-
-    x0 = max(0, min(x0, max(dst_w - 1, 0)))
-    y0 = max(0, min(y0, max(dst_h - 1, 0)))
-    x1 = max(x0 + 1, min(x1, dst_w))
-    y1 = max(y0 + 1, min(y1, dst_h))
-
-    sub = image.copy(x0, y0, x1 - x0, y1 - y0)
-    if sub.isNull():
-        raise RuntimeError("裁切 UV 结果失败")
-
-    ok = sub.save(output_path, "PNG")
-    if not ok:
-        raise RuntimeError("保存 UV 裁切图失败: {}".format(output_path))
 
     return {
         "result_path": output_path,
@@ -3456,6 +3337,32 @@ class AIGenPanel(QtWidgets.QWidget):
 
         return paths
 
+    def build_uv_submit_image_paths(self, record):
+        if not isinstance(record, dict):
+            return []
+
+        paths = []
+        seen = set()
+
+        def push(path):
+            path = str(path or "").strip()
+            if not path or not os.path.exists(path):
+                return
+            norm = normalize_path_str(path)
+            if norm in seen:
+                return
+            seen.add(norm)
+            paths.append(path)
+
+        push(record.get("uv_layout_path") or record.get("capture_path"))
+
+        push(record.get("multiview_atlas_path"))
+
+        for p in self.get_valid_reference_image_paths():
+            push(p)
+
+        return paths
+
     def build_effective_prompt(self, base_prompt, mode, ref_count, has_capture):
         return (base_prompt or "").strip()
 
@@ -4351,44 +4258,77 @@ class AIGenPanel(QtWidgets.QWidget):
 
     def delete_record_files(self, record):
         removed = []
+        removed_norm = set()
+
+        def add_removed(path):
+            norm = normalize_path_str(path)
+            if norm not in removed_norm:
+                removed_norm.add(norm)
+                removed.append(path)
+
+        def remove_file(path):
+            path = str(path or "").strip()
+            if not path:
+                return False
+
+            norm = normalize_path_str(path)
+            if norm in removed_norm:
+                return False
+
+            if safe_remove(path):
+                add_removed(path)
+                return True
+            return False
+
+        def remove_dir(path):
+            path = str(path or "").strip()
+            if not path or not os.path.isdir(path):
+                return False
+
+            norm = normalize_path_str(path)
+            if norm in removed_norm:
+                return False
+
+            try:
+                shutil.rmtree(path, ignore_errors=True)
+                add_removed(path)
+                return True
+            except Exception:
+                return False
+
+        if not isinstance(record, dict):
+            return removed
 
         if record.get("type") == "capture":
-            p = record.get("capture_path")
-            if safe_remove(p):
-                removed.append(p)
+            remove_file(record.get("capture_path"))
         elif record.get("type") == "result":
-            p = record.get("result_path")
-            if safe_remove(p):
-                removed.append(p)
+            remove_file(record.get("result_path"))
 
-        meta = record.get("meta_path")
-        if safe_remove(meta):
-            removed.append(meta)
+        remove_file(record.get("meta_path"))
+        remove_file(record.get("raw_uv_result_path"))
+        remove_file(record.get("composite_result_path"))
+        remove_file(record.get("raw_tile_path"))
+        remove_file(record.get("normal_source_result_path"))
 
-        raw_uv = record.get("raw_uv_result_path")
-        if safe_remove(raw_uv):
-            removed.append(raw_uv)
+        remove_file(record.get("uv_layout_path"))
+        remove_file(record.get("multiview_atlas_path"))
 
-        composite_result = record.get("composite_result_path")
-        if safe_remove(composite_result):
-            removed.append(composite_result)
+        uvguide_manifest = record.get("uvguide_manifest") or {}
+        if isinstance(uvguide_manifest, dict):
+            remove_file(uvguide_manifest.get("composite_path"))
+            remove_file(uvguide_manifest.get("multiview_atlas_path"))
 
-        raw_tile = record.get("raw_tile_path")
-        if safe_remove(raw_tile):
-            removed.append(raw_tile)
+        multiview_manifest = record.get("multiview_manifest") or {}
+        if isinstance(multiview_manifest, dict):
+            remove_file(multiview_manifest.get("atlas_path"))
 
         if record.get("type") == "result" and (
                 record.get("mode") == MODE_MULTI or record.get("is_multiview_result")
         ):
-            rp = record.get("result_path", "")
+            rp = str(record.get("result_path", "") or "").strip()
             if rp:
                 split_dir = os.path.splitext(rp)[0] + "_tiles"
-                if os.path.isdir(split_dir):
-                    try:
-                        shutil.rmtree(split_dir, ignore_errors=True)
-                        removed.append(split_dir)
-                    except Exception:
-                        pass
+                remove_dir(split_dir)
 
         return removed
 
@@ -4409,7 +4349,12 @@ class AIGenPanel(QtWidgets.QWidget):
         list_widget.takeItem(row)
 
         self.refresh_apply_button_from_selection()
-        self.log("已删除: {}".format(" | ".join([p for p in removed if p])))
+
+        if removed:
+            self.log("已删除: {}".format(" | ".join([p for p in removed if p])))
+        else:
+            self.log("记录已移除，但没有找到可删除的文件")
+
         self.status_label.setText("已删除记录")
 
     def _menu_exec(self, menu, pos):
@@ -4854,6 +4799,7 @@ class AIGenPanel(QtWidgets.QWidget):
         temp_records = []
         uv_export_file = None
         uv_export_dir = None
+        tmp_atlas_path = None
 
         try:
             for slot_name, slot_label in defs:
@@ -4883,64 +4829,61 @@ class AIGenPanel(QtWidgets.QWidget):
             uv_export_file, uv_export_dir = self.export_active_basecolor_map(output_dir)
             uv_pixmap = load_pixmap_safe(uv_export_file)
 
-        finally:
-            if original_camera:
-                try:
-                    self.apply_camera_state_and_wait(original_camera, timeout_ms=1000)
-                except Exception:
-                    pass
+            stamp = unique_stamp()
+            tmp_atlas_path = os.path.join(output_dir, "uvauto_views_tmp_{}.png".format(stamp))
+            atlas_saved_path = os.path.join(output_dir, "uvguide_views_{}.png".format(stamp))
 
-        stamp = unique_stamp()
-        tmp_atlas_path = os.path.join(output_dir, "uvauto_views_{}.png".format(stamp))
-        tmp_composite_path = os.path.join(output_dir, "uvauto_input_{}.png".format(stamp))
-
-        try:
             atlas_manifest = build_multiview_atlas(
                 tile_records=temp_records,
                 atlas_path=tmp_atlas_path,
                 tile_size=DEFAULT_UV_GUIDE_TILE_SIZE
             )
 
-            uvguide_manifest = build_uvguide_composite_from_pixmaps(
-                multiview_atlas_path=tmp_atlas_path,
-                uv_pixmap=uv_pixmap,
-                output_path=tmp_composite_path,
-                panel_size=DEFAULT_UV_GUIDE_TILE_SIZE * 2,
-                gap=32
-            )
+            shutil.copy2(tmp_atlas_path, atlas_saved_path)
+            atlas_manifest["atlas_path"] = atlas_saved_path
 
-            composite_pixmap = load_pixmap_safe(tmp_composite_path)
             record = self.save_capture_record(
-                pixmap=composite_pixmap,
+                pixmap=uv_pixmap,
                 output_dir=output_dir,
                 camera_state=None,
                 extra={
                     "mode": MODE_UV_GUIDE,
                     "is_uvguide_input": True,
+                    "uv_layout_path": "",
+                    "multiview_atlas_path": atlas_saved_path,
                     "multiview_manifest": atlas_manifest,
-                    "uvguide_manifest": uvguide_manifest,
+                    "uv_input_mode": "uv_primary_with_multiview_reference",
                 }
             )
+
+            record["uv_layout_path"] = record.get("capture_path", "")
             write_json(record["meta_path"], record)
 
             self.add_capture_item(record, select=True, prepend=True, lazy_icon=False)
             self.switch_preview_tab(self.capture_page, keep_selection=True)
-            self.status_label.setText("模型 + UV导出拼图完成")
-            self.log("UV 输入图已创建: {}".format(record["capture_path"]))
+            self.status_label.setText("UV主图 + 多视角参考图完成")
+            self.log("UV 主图已创建: {}".format(record["uv_layout_path"]))
+            self.log("多视角参考图已创建: {}".format(record["multiview_atlas_path"]))
             return record
 
         finally:
             for rec in temp_records:
                 self.delete_record_files(rec)
 
-            safe_remove(tmp_atlas_path)
-            safe_remove(tmp_composite_path)
+            if tmp_atlas_path:
+                safe_remove(tmp_atlas_path)
 
             if uv_export_file:
                 safe_remove(uv_export_file)
             if uv_export_dir and os.path.isdir(uv_export_dir):
                 try:
                     shutil.rmtree(uv_export_dir, ignore_errors=True)
+                except Exception:
+                    pass
+
+            if original_camera:
+                try:
+                    self.apply_camera_state_and_wait(original_camera, timeout_ms=1000)
                 except Exception:
                     pass
 
@@ -5222,7 +5165,7 @@ class AIGenPanel(QtWidgets.QWidget):
             self.refresh_apply_button_from_selection()
 
     def start_background_generate(self, capture_path=None, input_image_paths=None, camera_state=None, ctx=None,
-                                  prompt_override=None):
+                                  prompt_override=None, aspect_ratio_override=None):
         if self.gen_running:
             raise RuntimeError("已有生成任务正在运行")
 
@@ -5240,7 +5183,7 @@ class AIGenPanel(QtWidgets.QWidget):
         prompt = prompt_override if prompt_override is not None else user_prompt
 
         model = self.model_combo.currentText().strip()
-        aspect_ratio = "auto"
+        aspect_ratio = str(aspect_ratio_override or "auto").strip() or "auto"
         image_size = self.size_combo.currentText().strip()
         output_dir = self.current_output_dir(create=True)
 
@@ -5522,29 +5465,48 @@ class AIGenPanel(QtWidgets.QWidget):
 
             is_uvguide_capture = bool(selected_record.get("is_uvguide_input"))
             if is_uvguide_capture:
-                manifest = selected_record.get("uvguide_manifest")
-                if not manifest:
-                    raise RuntimeError("UV manifest 不存在")
+                uv_layout_path = str(selected_record.get("uv_layout_path") or capture_path or "").strip()
+                multiview_atlas_path = str(selected_record.get("multiview_atlas_path") or "").strip()
 
-                self.log("UV 模式生成")
-                self.log("UV 输入尺寸: {}x{}".format(*get_image_size_safe(capture_path)))
-                self.log("UV 比例策略: auto")
+                if not uv_layout_path or not os.path.exists(uv_layout_path):
+                    raise RuntimeError("UV 主图不存在")
+
+                if not multiview_atlas_path or not os.path.exists(multiview_atlas_path):
+                    raise RuntimeError("当前 UV 记录缺少多视角参考图，请重新截图")
+
+                submit_paths = self.build_uv_submit_image_paths(selected_record)
+                if not submit_paths:
+                    raise RuntimeError("UV 模式没有可提交的输入图")
+
+                uv_aspect_ratio = "1:1"
+
+                self.log("UV 模式生成（UV主图 + 多视角参考图）")
+                self.log("UV 主图尺寸: {}x{}".format(*get_image_size_safe(uv_layout_path)))
+                self.log("多视角参考图尺寸: {}x{}".format(*get_image_size_safe(multiview_atlas_path)))
+                self.log("UV 输出比例: {}".format(uv_aspect_ratio))
+                self.log("提交图像数: {}".format(len(submit_paths)))
+                for idx, p in enumerate(submit_paths):
+                    w, h = get_image_size_safe(p)
+                    self.log("  [{}] {} | {}x{}".format(idx, p, w, h))
+
                 if ref_paths:
-                    self.log("附加参考图 {} 张".format(len(ref_paths)))
+                    self.log("附加用户参考图 {} 张".format(len(ref_paths)))
 
                 ctx = {
                     "mode": MODE_UV_GUIDE,
-                    "uvguide_manifest": manifest,
                     "reference_image_paths": list(ref_paths),
-                    "record_capture_path": capture_path,
+                    "record_capture_path": uv_layout_path,
+                    "uv_layout_path": uv_layout_path,
+                    "multiview_atlas_path": multiview_atlas_path,
                 }
 
                 self.start_background_generate(
-                    capture_path=capture_path,
+                    capture_path=uv_layout_path,
                     input_image_paths=submit_paths,
                     camera_state=None,
                     ctx=ctx,
-                    prompt_override=effective_prompt
+                    prompt_override=effective_prompt,
+                    aspect_ratio_override=uv_aspect_ratio
                 )
                 return
 
@@ -5621,25 +5583,6 @@ class AIGenPanel(QtWidgets.QWidget):
                 self.preview_tabs.setCurrentWidget(self.log_page)
                 self.set_status("生成完成，但结果图片无法解码")
                 return
-
-            if record.get("mode") == MODE_UV_GUIDE and record.get("uvguide_manifest"):
-                try:
-                    full_result_path = result_path
-                    uv_result_path = os.path.splitext(full_result_path)[0] + "_uv.png"
-
-                    crop_info = split_uvguide_result_by_manifest(
-                        result_image_path=full_result_path,
-                        manifest=record.get("uvguide_manifest"),
-                        output_path=uv_result_path
-                    )
-
-                    record["composite_result_path"] = full_result_path
-                    record["result_path"] = crop_info["result_path"]
-                    self.last_result_path = record["result_path"]
-                    write_json(record["meta_path"], record)
-                    result_path = record["result_path"]
-                except Exception as e:
-                    self.log("UV 结果裁切失败，保留整图结果: {}".format(e))
 
             if (
                     record.get("mode") == MODE_SINGLE and
