@@ -1652,10 +1652,84 @@ class NanoBananaClient(object):
 
         return headers
 
+    def prepare_upload_image_bytes_and_mime(self, image_path, max_side=1536):
+        try:
+            image = QtGui.QImage(image_path)
+            if image.isNull():
+                ext = os.path.splitext(image_path)[1].lower()
+                mime = {
+                    ".png": "image/png",
+                    ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg",
+                    ".webp": "image/webp",
+                    ".bmp": "image/bmp",
+                }.get(ext, "application/octet-stream")
+                return read_binary(image_path), mime
+
+            src_w = image.width()
+            src_h = image.height()
+            if src_w <= 0 or src_h <= 0:
+                return read_binary(image_path), "application/octet-stream"
+
+            max_side = max(256, int(max_side))
+
+            if max(src_w, src_h) <= max_side:
+                ext = os.path.splitext(image_path)[1].lower()
+                mime = {
+                    ".png": "image/png",
+                    ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg",
+                    ".webp": "image/webp",
+                    ".bmp": "image/bmp",
+                }.get(ext, "image/png")
+                return read_binary(image_path), mime
+
+            scaled = image.scaled(
+                QtCore.QSize(max_side, max_side),
+                QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                QtCore.Qt.TransformationMode.SmoothTransformation
+            )
+
+            has_alpha = scaled.hasAlphaChannel()
+
+            byte_array = QtCore.QByteArray()
+            buffer = QtCore.QBuffer(byte_array)
+            buffer.open(QtCore.QIODevice.OpenModeFlag.WriteOnly)
+
+            if has_alpha:
+                ok = scaled.save(buffer, "PNG")
+                mime = "image/png"
+            else:
+                ok = scaled.save(buffer, "JPG", quality=92)
+                mime = "image/jpeg"
+
+            buffer.close()
+
+            if ok and not byte_array.isEmpty():
+                return bytes(byte_array), mime
+
+        except Exception:
+            pass
+
+        ext = os.path.splitext(image_path)[1].lower()
+        mime = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+            ".bmp": "image/bmp",
+        }.get(ext, "application/octet-stream")
+        return read_binary(image_path), mime
+
+    def get_upload_max_side(self, image_path=None):
+        return 1536
+
     def image_file_to_base64(self, image_path):
-        b64 = base64.b64encode(read_binary(image_path)).decode("utf-8")
+        max_side = self.get_upload_max_side(image_path)
+        data, mime = self.prepare_upload_image_bytes_and_mime(image_path, max_side=max_side)
+        b64 = base64.b64encode(data).decode("utf-8")
         if self.use_data_url_prefix:
-            return "data:image/png;base64," + b64
+            return "data:{};base64,{}".format(mime, b64)
         return b64
 
     def submit_task_common(self, prompt, model, aspect_ratio, image_size, urls=None, shut_progress=True,
@@ -1843,7 +1917,17 @@ class NanoBananaClient(object):
             if status == "failed":
                 failure_reason = result.get("failure_reason", "")
                 error = result.get("error", "")
-                raise RuntimeError("生成失败: failure_reason={}, error={}".format(failure_reason, error))
+
+                if progress_cb:
+                    progress_cb("任务失败: failure_reason={}, error={}".format(failure_reason, error))
+
+                raise RuntimeError(
+                    "生成失败: failure_reason={}, error={}, raw={}".format(
+                        failure_reason,
+                        error,
+                        json.dumps(data, ensure_ascii=False)
+                    )
+                )
 
             wait_left = self.poll_interval
             while wait_left > 0:
@@ -1945,8 +2029,65 @@ class RunningHubClient(object):
                 headers["Authorization"] = "Bearer {}".format(api_key)
         return headers
 
-    def image_file_to_data_uri(self, image_path):
-        data = read_binary(image_path)
+    def prepare_upload_image_bytes_and_mime(self, image_path, max_side=1536):
+        try:
+            image = QtGui.QImage(image_path)
+            if image.isNull():
+                ext = os.path.splitext(image_path)[1].lower()
+                mime = {
+                    ".png": "image/png",
+                    ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg",
+                    ".webp": "image/webp",
+                    ".bmp": "image/bmp",
+                }.get(ext, "application/octet-stream")
+                return read_binary(image_path), mime
+
+            src_w = image.width()
+            src_h = image.height()
+            if src_w <= 0 or src_h <= 0:
+                return read_binary(image_path), "application/octet-stream"
+
+            max_side = max(256, int(max_side))
+
+            if max(src_w, src_h) <= max_side:
+                ext = os.path.splitext(image_path)[1].lower()
+                mime = {
+                    ".png": "image/png",
+                    ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg",
+                    ".webp": "image/webp",
+                    ".bmp": "image/bmp",
+                }.get(ext, "image/png")
+                return read_binary(image_path), mime
+
+            scaled = image.scaled(
+                QtCore.QSize(max_side, max_side),
+                QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                QtCore.Qt.TransformationMode.SmoothTransformation
+            )
+
+            has_alpha = scaled.hasAlphaChannel()
+
+            byte_array = QtCore.QByteArray()
+            buffer = QtCore.QBuffer(byte_array)
+            buffer.open(QtCore.QIODevice.OpenModeFlag.WriteOnly)
+
+            if has_alpha:
+                ok = scaled.save(buffer, "PNG")
+                mime = "image/png"
+            else:
+                ok = scaled.save(buffer, "JPG", quality=92)
+                mime = "image/jpeg"
+
+            buffer.close()
+
+            if ok and not byte_array.isEmpty():
+                return bytes(byte_array), mime
+
+        except Exception:
+            pass
+
         ext = os.path.splitext(image_path)[1].lower()
         mime = {
             ".png": "image/png",
@@ -1955,20 +2096,26 @@ class RunningHubClient(object):
             ".webp": "image/webp",
             ".bmp": "image/bmp",
         }.get(ext, "application/octet-stream")
+        return read_binary(image_path), mime
+
+    def get_upload_max_side(self, image_path=None):
+        return 1536
+
+    def image_file_to_data_uri(self, image_path):
+        data, mime = self.prepare_upload_image_bytes_and_mime(
+            image_path,
+            max_side=self.get_upload_max_side(image_path)
+        )
         b64 = base64.b64encode(data).decode("utf-8")
         return "data:{};base64,{}".format(mime, b64)
 
     def upload_binary_and_get_url(self, image_path):
         url = self.api_base + self.upload_path
         filename = os.path.basename(image_path)
-        ext = os.path.splitext(filename)[1].lower()
-        mime = {
-            ".png": "image/png",
-            ".jpg": "image/jpeg",
-            ".jpeg": "image/jpeg",
-            ".webp": "image/webp",
-            ".bmp": "image/bmp",
-        }.get(ext, "application/octet-stream")
+        data, mime = self.prepare_upload_image_bytes_and_mime(
+            image_path,
+            max_side=self.get_upload_max_side(image_path)
+        )
 
         _, text, data = http_post_multipart(
             url=url,
@@ -1976,7 +2123,7 @@ class RunningHubClient(object):
             files=[{
                 "name": "file",
                 "filename": filename,
-                "content": read_binary(image_path),
+                "content": data,
                 "content_type": mime,
             }],
             timeout=60
@@ -4947,29 +5094,7 @@ class AIGenPanel(QtWidgets.QWidget):
 
     def refresh_client_settings(self):
         self.settings_data = load_plugin_settings()
-        s = self.settings_data
-
-        self.client.api_base = (s.get("api_base", API_BASE) or API_BASE).rstrip("/")
-        self.client.api_key = (s.get("api_key", "") or "").strip()
-        self.client.submit_path = normalize_api_path(s.get("submit_path"), SUBMIT_PATH)
-        self.client.result_path = normalize_api_path(s.get("result_path"), RESULT_PATH)
-        self.client.poll_interval = float(s.get("poll_interval", DEFAULT_POLL_INTERVAL))
-        self.client.poll_timeout = int(float(s.get("poll_timeout", DEFAULT_POLL_TIMEOUT)))
-        self.client.auth_mode = (s.get("auth_mode", "bearer") or "bearer").strip().lower()
-
-        if hasattr(self.client, "use_data_url_prefix"):
-            self.client.use_data_url_prefix = bool(s.get("use_data_url_prefix", False))
-
-        if hasattr(self.client, "upload_path"):
-            self.client.upload_path = normalize_api_path(
-                s.get("runninghub_upload_path"),
-                RUNNINGHUB_UPLOAD_PATH
-            )
-
-        if hasattr(self.client, "upload_mode"):
-            self.client.upload_mode = str(
-                s.get("runninghub_upload_mode", RUNNINGHUB_UPLOAD_DATA_URI) or RUNNINGHUB_UPLOAD_DATA_URI
-            ).strip().lower()
+        self.client = self.build_client_from_settings(self.settings_data)
 
         invalid_values = {"", "API_KEY", "YOUR_API_KEY", "None", "null"}
         if (self.client.api_key or "").strip() in invalid_values:
@@ -5165,6 +5290,57 @@ class AIGenPanel(QtWidgets.QWidget):
         else:
             self.refresh_apply_button_from_selection()
 
+    def is_retryable_generate_error(self, msg):
+        text = str(msg or "").lower()
+        keys = [
+            "google gemini timeout",
+            "timeout",
+            "timed out",
+            "gateway timeout",
+            "upstream timeout",
+            "temporarily unavailable",
+            "failure_reason=error",
+        ]
+        return any(k in text for k in keys)
+
+    def normalize_model_image_size(self, model, image_size):
+        model = str(model or "").strip()
+        image_size = str(image_size or "").strip().upper()
+
+        allowed_map = {
+            "nano-banana-2-cl": ["1K", "2K"],
+            "nano-banana-2-4k-cl": ["4K"],
+            "nano-banana-pro-vip": ["1K", "2K"],
+            "nano-banana-pro-4k-vip": ["4K"],
+        }
+
+        allowed = allowed_map.get(model)
+        if not allowed:
+            return image_size
+
+        if image_size in allowed:
+            return image_size
+
+        if image_size == "4K":
+            if "2K" in allowed:
+                return "2K"
+            if "1K" in allowed:
+                return "1K"
+
+        if image_size == "2K":
+            if "1K" in allowed:
+                return "1K"
+            if "4K" in allowed:
+                return "4K"
+
+        if image_size == "1K":
+            if "2K" in allowed:
+                return "2K"
+            if "4K" in allowed:
+                return "4K"
+
+        return allowed[0]
+
     def start_background_generate(self, capture_path=None, input_image_paths=None, camera_state=None, ctx=None,
                                   prompt_override=None, aspect_ratio_override=None):
         if self.gen_running:
@@ -5185,7 +5361,15 @@ class AIGenPanel(QtWidgets.QWidget):
 
         model = self.model_combo.currentText().strip()
         aspect_ratio = str(aspect_ratio_override or "auto").strip() or "auto"
-        image_size = self.size_combo.currentText().strip()
+        image_size = self.size_combo.currentText().strip().upper()
+
+        fixed_image_size = self.normalize_model_image_size(model, image_size)
+        if fixed_image_size != image_size:
+            self.log("检测到模型 {} 不兼容分辨率 {}，已自动调整为 {}".format(
+                model, image_size, fixed_image_size
+            ))
+            image_size = fixed_image_size
+
         output_dir = self.current_output_dir(create=True)
 
         submit_image_paths = list(input_image_paths or [])
@@ -5193,6 +5377,19 @@ class AIGenPanel(QtWidgets.QWidget):
             submit_image_paths = [capture_path]
 
         record_capture_path = str(ctx.get("record_capture_path", capture_path or "") or "").strip()
+
+        self.log("生成参数: provider={}".format(self.settings_data.get("provider", "")))
+        self.log("生成参数: model={}".format(model))
+        self.log("生成参数: aspect_ratio={}".format(aspect_ratio))
+        self.log("生成参数: image_size={}".format(image_size))
+        self.log("生成参数: submit_image_count={}".format(len(submit_image_paths)))
+        self.log("生成参数: use_data_url_prefix={}".format(
+            getattr(self.client, "use_data_url_prefix", None)
+        ))
+
+        for idx, p in enumerate(submit_image_paths):
+            w, h = get_image_size_safe(p)
+            self.log("提交图[{}]: {} | {}x{}".format(idx, p, w, h))
 
         def progress_cb(text):
             self.gen_queue.put({
@@ -5205,41 +5402,72 @@ class AIGenPanel(QtWidgets.QWidget):
 
         def thread_main():
             try:
-                progress_cb("正在提交 nano-banana...")
+                max_attempts = 2
+                image_bytes = None
+                last_error = None
 
-                if submit_image_paths:
-                    if len(submit_image_paths) == 1:
-                        image_bytes = self.client.generate_from_image(
-                            image_path=submit_image_paths[0],
-                            prompt=prompt,
-                            model=model,
-                            aspect_ratio=aspect_ratio,
-                            image_size=image_size,
-                            shut_progress=True,
-                            progress_cb=progress_cb,
-                            cancel_cb=cancel_cb
-                        )
-                    else:
-                        image_bytes = self.client.generate_from_images(
-                            image_paths=submit_image_paths,
-                            prompt=prompt,
-                            model=model,
-                            aspect_ratio=aspect_ratio,
-                            image_size=image_size,
-                            shut_progress=True,
-                            progress_cb=progress_cb,
-                            cancel_cb=cancel_cb
-                        )
-                else:
-                    image_bytes = self.client.generate_from_prompt(
-                        prompt=prompt,
-                        model=model,
-                        aspect_ratio=aspect_ratio,
-                        image_size=image_size,
-                        shut_progress=True,
-                        progress_cb=progress_cb,
-                        cancel_cb=cancel_cb
-                    )
+                for attempt in range(1, max_attempts + 1):
+                    try:
+                        progress_cb("正在提交 nano-banana... ({}/{})".format(attempt, max_attempts))
+
+                        if submit_image_paths:
+                            if len(submit_image_paths) == 1:
+                                image_bytes = self.client.generate_from_image(
+                                    image_path=submit_image_paths[0],
+                                    prompt=prompt,
+                                    model=model,
+                                    aspect_ratio=aspect_ratio,
+                                    image_size=image_size,
+                                    shut_progress=True,
+                                    progress_cb=progress_cb,
+                                    cancel_cb=cancel_cb
+                                )
+                            else:
+                                image_bytes = self.client.generate_from_images(
+                                    image_paths=submit_image_paths,
+                                    prompt=prompt,
+                                    model=model,
+                                    aspect_ratio=aspect_ratio,
+                                    image_size=image_size,
+                                    shut_progress=True,
+                                    progress_cb=progress_cb,
+                                    cancel_cb=cancel_cb
+                                )
+                        else:
+                            image_bytes = self.client.generate_from_prompt(
+                                prompt=prompt,
+                                model=model,
+                                aspect_ratio=aspect_ratio,
+                                image_size=image_size,
+                                shut_progress=True,
+                                progress_cb=progress_cb,
+                                cancel_cb=cancel_cb
+                            )
+
+                        break
+
+                    except Exception as e:
+                        last_error = e
+                        err_text = str(e)
+
+                        if cancel_cb and cancel_cb():
+                            raise RuntimeError("已取消")
+
+                        if attempt >= max_attempts or not self.is_retryable_generate_error(err_text):
+                            raise
+
+                        progress_cb("检测到可重试错误，准备重试: {}".format(err_text))
+
+                        wait_left = 2.0
+                        while wait_left > 0:
+                            if cancel_cb and cancel_cb():
+                                raise RuntimeError("已取消")
+                            step = min(0.2, wait_left)
+                            time.sleep(step)
+                            wait_left -= step
+
+                if image_bytes is None:
+                    raise RuntimeError("生成失败: 未获得图片数据，last_error={}".format(last_error))
 
                 ensure_dir(output_dir)
 
