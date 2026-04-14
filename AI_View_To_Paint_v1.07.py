@@ -3440,8 +3440,8 @@ class AIGenPanel(QtWidgets.QWidget):
 
         self.prompt_edit = QtWidgets.QPlainTextEdit()
         self.prompt_edit.setPlaceholderText("例如：高细节科幻金属材质，红黑配色，边缘磨损，工业风，超清纹理表现")
-        self.prompt_edit.setMinimumHeight(72)
-        self.prompt_edit.setMaximumHeight(96)
+        self.prompt_edit.setMinimumHeight(50)
+        self.prompt_edit.setMaximumHeight(120)
         self.prompt_edit.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
             QtWidgets.QSizePolicy.Policy.Fixed
