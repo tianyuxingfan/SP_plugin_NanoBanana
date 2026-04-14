@@ -100,7 +100,7 @@ DEFAULT_SETTINGS = {
     "default_image_size": DEFAULT_IMAGE_SIZE,
     "poll_interval": DEFAULT_POLL_INTERVAL,
     "poll_timeout": DEFAULT_POLL_TIMEOUT,
-    "use_data_url_prefix": False,
+    "use_data_url_prefix": True,
     "output_dir": DEFAULT_OUTPUT_DIR,
 
     "runninghub_upload_path": RUNNINGHUB_UPLOAD_PATH,
@@ -243,6 +243,158 @@ UV_EXPORT_PRESET_NAME = "2D View"
 panel_widget = None
 panel_dock = None
 
+LOG_DEBUG = 10
+LOG_INFO = 20
+LOG_WARN = 30
+LOG_ERROR = 40
+
+DEFAULT_LOG_LEVEL = LOG_INFO
+ENABLE_HTTP_DEBUG_BODY = False
+
+_log_level = DEFAULT_LOG_LEVEL
+_ui_log_sink = None
+
+
+def set_log_level(level):
+    global _log_level
+    try:
+        _log_level = int(level)
+    except Exception:
+        _log_level = DEFAULT_LOG_LEVEL
+
+
+def get_log_level():
+    return _log_level
+
+
+def set_ui_log_sink(fn):
+    global _ui_log_sink
+    _ui_log_sink = fn
+
+
+def now_time_str():
+    return time.strftime("%H:%M:%S")
+
+
+def level_name(level):
+    if level >= LOG_ERROR:
+        return "ERROR"
+    if level >= LOG_WARN:
+        return "WARN"
+    if level >= LOG_INFO:
+        return "INFO"
+    return "DEBUG"
+
+
+def _format_log_line(level, tag, text):
+    return "[{}] [{}] [{}] {}".format(
+        now_time_str(),
+        level_name(level),
+        str(tag or "APP").upper(),
+        str(text or "")
+    )
+
+
+def _emit_log(level, tag, text):
+    if level < get_log_level():
+        return
+
+    line = _format_log_line(level, tag, text)
+
+    try:
+        print(line)
+    except Exception:
+        pass
+
+    sink = _ui_log_sink
+    if callable(sink):
+        try:
+            sink(line)
+        except Exception:
+            pass
+
+
+def log_debug(tag, text):
+    _emit_log(LOG_DEBUG, tag, text)
+
+
+def log_info(tag, text):
+    _emit_log(LOG_INFO, tag, text)
+
+
+def log_warn(tag, text):
+    _emit_log(LOG_WARN, tag, text)
+
+
+def log_error(tag, text):
+    _emit_log(LOG_ERROR, tag, text)
+
+
+def short_text(text, limit=240):
+    s = str(text or "")
+    if len(s) <= limit:
+        return s
+    return s[:limit] + "...<truncated:{} chars>".format(len(s))
+
+
+def short_json(data, limit=320):
+    try:
+        s = json.dumps(data, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        s = str(data)
+    return short_text(s, limit=limit)
+
+
+def mask_secret(text, keep_left=6, keep_right=4):
+    s = str(text or "")
+    if not s:
+        return ""
+    if len(s) <= keep_left + keep_right:
+        return "*" * len(s)
+    return s[:keep_left] + "*" * (len(s) - keep_left - keep_right) + s[-keep_right:]
+
+
+def sanitize_headers(headers):
+    out = dict(headers or {})
+    auth = out.get("Authorization")
+    if auth:
+        out["Authorization"] = mask_secret(auth, keep_left=10, keep_right=6)
+    return out
+
+
+def basename_list(paths, max_count=4):
+    arr = []
+    src = list(paths or [])
+    for p in src[:max_count]:
+        arr.append(os.path.basename(str(p or "")))
+    extra = max(0, len(src) - len(arr))
+    if extra > 0:
+        arr.append("+{} more".format(extra))
+    return ", ".join(arr)
+
+
+def ui_path_text(path):
+    path = str(path or "").strip()
+    if not path:
+        return ""
+    return os.path.basename(path)
+
+
+def ui_join_paths(paths):
+    arr = []
+    for p in list(paths or []):
+        t = ui_path_text(p)
+        if t:
+            arr.append(t)
+    return " | ".join(arr)
+
+
+def image_paths_summary(paths):
+    items = []
+    for p in list(paths or []):
+        w, h = get_image_size_safe(p)
+        items.append("{}({}x{})".format(os.path.basename(str(p or "")), w, h))
+    return ", ".join(items)
 
 def ensure_dir(path):
     if not path:
@@ -417,21 +569,37 @@ def now_str_readable():
 
 def http_post_json(url, headers, payload, timeout=120):
     data = json.dumps(payload).encode("utf-8")
+    safe_headers = sanitize_headers(headers)
+
+    log_debug("HTTP", "POST {} headers={}".format(url, short_json(safe_headers, 240)))
+    log_debug("HTTP", "POST {} payload={}".format(url, short_json(payload, 400)))
+
     req = urllib.request.Request(url=url, data=data, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
             status_code = resp.getcode()
             body = resp.read()
             text = body.decode("utf-8", errors="replace")
+
+            log_debug("HTTP", "POST {} -> status={}".format(url, status_code))
+            if ENABLE_HTTP_DEBUG_BODY:
+                log_debug("HTTP", "POST {} response={}".format(url, short_text(text, 1200)))
+
             try:
                 parsed = json.loads(text)
             except Exception:
                 parsed = None
             return status_code, text, parsed
+
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
+        log_error("HTTP", "POST {} -> HTTPError {} body={}".format(
+            url, e.code, short_text(body, 600)
+        ))
         raise RuntimeError("HTTPError {}: {}".format(e.code, body))
+
     except urllib.error.URLError as e:
+        log_error("HTTP", "POST {} -> URLError {}".format(url, repr(e)))
         raise RuntimeError("URLError: {}".format(e))
 
 
@@ -472,12 +640,33 @@ def http_post_multipart(url, headers=None, fields=None, files=None, timeout=120)
     req_headers = dict(headers or {})
     req_headers["Content-Type"] = "multipart/form-data; boundary={}".format(boundary)
 
+    debug_files = []
+    for f in (files or []):
+        debug_files.append({
+            "name": f.get("name"),
+            "filename": f.get("filename"),
+            "content_type": f.get("content_type"),
+            "bytes": len(f.get("content", b"") or b"")
+        })
+
+    log_debug("HTTP", "MULTIPART POST {} headers={}".format(
+        url, short_json(sanitize_headers(req_headers), 240)
+    ))
+    log_debug("HTTP", "MULTIPART POST {} files={}".format(
+        url, short_json(debug_files, 400)
+    ))
+
     req = urllib.request.Request(url=url, data=bytes(body), headers=req_headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
             status_code = resp.getcode()
             raw = resp.read()
             text = raw.decode("utf-8", errors="replace")
+
+            log_debug("HTTP", "MULTIPART POST {} -> status={}".format(url, status_code))
+            if ENABLE_HTTP_DEBUG_BODY:
+                log_debug("HTTP", "MULTIPART POST {} response={}".format(url, short_text(text, 1200)))
+
             try:
                 parsed = json.loads(text)
             except Exception:
@@ -485,20 +674,31 @@ def http_post_multipart(url, headers=None, fields=None, files=None, timeout=120)
             return status_code, text, parsed
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
+        log_error("HTTP", "MULTIPART POST {} -> HTTPError {} body={}".format(
+            url, e.code, short_text(body, 600)
+        ))
         raise RuntimeError("HTTPError {}: {}".format(e.code, body))
     except urllib.error.URLError as e:
+        log_error("HTTP", "MULTIPART POST {} -> URLError {}".format(url, repr(e)))
         raise RuntimeError("URLError: {}".format(e))
 
 
 def http_get_bytes(url, timeout=120):
     req = urllib.request.Request(url=url, method="GET")
+    log_debug("HTTP", "GET {}".format(url))
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
-            return resp.read()
+            data = resp.read()
+            log_debug("HTTP", "GET {} -> {} bytes".format(url, len(data)))
+            return data
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
+        log_error("HTTP", "GET {} -> HTTPError {} body={}".format(
+            url, e.code, short_text(body, 600)
+        ))
         raise RuntimeError("HTTPError {}: {}".format(e.code, body))
     except urllib.error.URLError as e:
+        log_error("HTTP", "GET {} -> URLError {}".format(url, repr(e)))
         raise RuntimeError("URLError: {}".format(e))
 
 
@@ -1728,6 +1928,14 @@ class NanoBananaClient(object):
         max_side = self.get_upload_max_side(image_path)
         data, mime = self.prepare_upload_image_bytes_and_mime(image_path, max_side=max_side)
         b64 = base64.b64encode(data).decode("utf-8")
+
+        log_debug("API", "GRSAI encode image={} mime={} bytes={} max_side={}".format(
+            os.path.basename(str(image_path or "")),
+            mime,
+            len(data),
+            max_side
+        ))
+
         if self.use_data_url_prefix:
             return "data:{};base64,{}".format(mime, b64)
         return b64
@@ -1750,6 +1958,12 @@ class NanoBananaClient(object):
             payload["urls"] = urls
 
         url = self.api_base + self.submit_path
+
+        log_info("API", "提交任务: provider=grsai images={}".format(len(urls or [])))
+        log_debug("API", "GRSAI submit url={} model={} size={} aspect={}".format(
+            url, model, image_size, aspect_ratio
+        ))
+
         _, text, data = http_post_json(url=url, headers=self._headers(), payload=payload, timeout=30)
 
         if cancel_cb and cancel_cb():
@@ -1757,6 +1971,7 @@ class NanoBananaClient(object):
 
         if not isinstance(data, dict):
             raise RuntimeError("提交接口返回不是 JSON: {}".format(text))
+
         if data.get("code") != 0:
             raise RuntimeError("提交失败: {}".format(text))
 
@@ -1765,6 +1980,7 @@ class NanoBananaClient(object):
         except Exception:
             raise RuntimeError("提交成功但缺少 data.id: {}".format(text))
 
+        log_debug("API", "GRSAI 提交成功: task_id={}".format(task_id))
         return task_id
 
     def submit_task_multi(self, image_paths, prompt, model, aspect_ratio, image_size, shut_progress=True,
@@ -1829,6 +2045,9 @@ class NanoBananaClient(object):
 
         url = self.api_base + self.result_path
         payload = {"id": task_id}
+
+        log_debug("API", "GRSAI query_result task_id={}".format(task_id))
+
         _, text, data = http_post_json(url=url, headers=self._headers(), payload=payload, timeout=15)
 
         if cancel_cb and cancel_cb():
@@ -2117,6 +2336,9 @@ class RunningHubClient(object):
             max_side=self.get_upload_max_side(image_path)
         )
 
+        log_info("API", "RunningHub 上传图片: {}".format(filename))
+        log_debug("API", "RunningHub upload mime={} bytes={}".format(mime, len(data)))
+
         _, text, data = http_post_multipart(
             url=url,
             headers=self._headers(include_content_type=False),
@@ -2140,6 +2362,8 @@ class RunningHubClient(object):
         if not download_url:
             raise RuntimeError("RunningHub 上传成功但缺少 data.download_url: {}".format(text))
 
+        log_info("API", "RunningHub 上传成功")
+        log_debug("API", "RunningHub upload url={}".format(download_url))
         return download_url
 
     def _map_aspect_ratio(self, aspect_ratio):
@@ -2244,6 +2468,14 @@ class RunningHubClient(object):
             payload["imageUrls"] = image_urls
 
         url = self.api_base + self.submit_path
+
+        log_info("API", "提交任务: provider=runninghub images={}".format(len(image_urls or [])))
+        log_debug("API", "RunningHub submit url={} size={} aspect={}".format(
+            url,
+            self._map_resolution(image_size),
+            self._map_aspect_ratio(aspect_ratio)
+        ))
+
         _, text, data = http_post_json(
             url=url,
             headers=self._headers(include_content_type=True),
@@ -2261,6 +2493,7 @@ class RunningHubClient(object):
         if not task_id:
             raise RuntimeError("RunningHub 提交成功但缺少 taskId: {}".format(text))
 
+        log_debug("API", "RunningHub 提交成功: task_id={}".format(task_id))
         return task_id
 
     def submit_task(self, image_path, prompt, model, aspect_ratio, image_size, shut_progress=True, cancel_cb=None):
@@ -2285,6 +2518,8 @@ class RunningHubClient(object):
 
         url = self.api_base + self.result_path
         payload = {"taskId": task_id}
+
+        log_debug("API", "RunningHub query_result task_id={}".format(task_id))
 
         _, text, data = http_post_json(
             url=url,
@@ -3060,6 +3295,9 @@ class AIGenPanel(QtWidgets.QWidget):
         self.resize(460, 860)
 
         self._build_ui()
+        set_ui_log_sink(self.append_ui_log_line)
+        self._sync_log_runtime_settings()
+
         self.apply_settings_to_ui()
         self.refresh_reference_images_button_text()
 
@@ -3099,16 +3337,19 @@ class AIGenPanel(QtWidgets.QWidget):
         old_output_dir = normalize_path_str(self.output_dir_edit.text().strip())
 
         current_settings = dict(self.settings_data)
-        current_settings["output_dir"] = self.output_dir_edit.text().strip() or current_settings.get("output_dir",
-                                                                                                     DEFAULT_OUTPUT_DIR)
+        current_settings["output_dir"] = self.output_dir_edit.text().strip() or current_settings.get(
+            "output_dir", DEFAULT_OUTPUT_DIR
+        )
         current_settings["default_model"] = self.model_combo.currentText().strip() or current_settings.get(
-            "default_model", DEFAULT_MODEL)
+            "default_model", DEFAULT_MODEL
+        )
 
         dlg = SettingsDialog(current_settings, self)
         if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
 
         self.settings_data = save_plugin_settings(dlg.get_settings())
+        self._sync_log_runtime_settings()
         self.apply_settings_to_ui()
         self.refresh_client_settings()
 
@@ -3117,10 +3358,13 @@ class AIGenPanel(QtWidgets.QWidget):
             self.clear_preview()
             self.reload_galleries(log_message=False)
 
-        self.log("平台设置已保存: provider={} api_base={}".format(
-            self.settings_data.get("provider", ""),
-            self.settings_data.get("api_base", "")
-        ))
+        self.log(
+            "设置已保存: provider={} api_base={}".format(
+                self.settings_data.get("provider", ""),
+                self.settings_data.get("api_base", "")
+            ),
+            tag="SET"
+        )
         self.status_label.setText("设置已保存")
 
     def _build_ui(self):
@@ -3318,6 +3562,10 @@ class AIGenPanel(QtWidgets.QWidget):
 
         self.log_edit = QtWidgets.QPlainTextEdit()
         self.log_edit.setReadOnly(True)
+        self.log_edit.document().setMaximumBlockCount(1000)
+        self.log_edit.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.log_edit.customContextMenuRequested.connect(self.on_log_context_menu)
+
         self.log_page = QtWidgets.QWidget()
         log_layout = QtWidgets.QVBoxLayout(self.log_page)
         log_layout.setContentsMargins(2, 2, 2, 2)
@@ -3472,17 +3720,17 @@ class AIGenPanel(QtWidgets.QWidget):
         self.refresh_reference_images_button_text()
 
         count = len(self.get_valid_reference_image_paths())
-        self.log("参考图数量: {}".format(count))
+        self.log("已更新参考图: {} 张".format(count), tag="UI")
 
         self.refresh_prompt_by_mode_and_refs(force=False)
 
     def build_submit_image_paths(self, capture_path=None):
         paths = []
-        paths.extend(self.get_valid_reference_image_paths())
 
         if capture_path:
             paths.append(capture_path)
 
+        paths.extend(self.get_valid_reference_image_paths())
         return paths
 
     def build_uv_submit_image_paths(self, record):
@@ -3514,8 +3762,70 @@ class AIGenPanel(QtWidgets.QWidget):
     def build_effective_prompt(self, base_prompt, mode, ref_count, has_capture):
         return (base_prompt or "").strip()
 
-    def log(self, text):
-        self.log_edit.appendPlainText(text)
+    def log(self, text, level=LOG_INFO, tag="UI"):
+        _emit_log(level, tag, text)
+
+    def _sync_log_runtime_settings(self):
+        debug_enabled = bool(self.settings_data.get("debug_logging", False))
+        set_log_level(LOG_DEBUG if debug_enabled else LOG_INFO)
+
+        global ENABLE_HTTP_DEBUG_BODY
+        ENABLE_HTTP_DEBUG_BODY = bool(self.settings_data.get("http_debug_body", False))
+
+    def append_ui_log_line(self, text):
+        scrollbar = self.log_edit.verticalScrollBar()
+        should_stick_bottom = True
+
+        if scrollbar is not None:
+            should_stick_bottom = (scrollbar.value() >= scrollbar.maximum() - 4)
+
+        self.log_edit.appendPlainText(str(text))
+
+        if should_stick_bottom and scrollbar is not None:
+            scrollbar.setValue(scrollbar.maximum())
+
+    def _normalize_progress_log_key(self, text):
+        s = str(text or "").strip()
+        low = s.lower()
+
+        if "任务已提交" in s:
+            return "submitted"
+
+        if "结果已完成" in s:
+            return "download"
+
+        if "网络波动" in s or "重试" in s:
+            return s
+
+        if "任务中..." in s:
+            status = "unknown"
+            progress_bucket = None
+
+            if "status=" in low:
+                try:
+                    part = low.split("status=", 1)[1]
+                    status = part.split()[0].split(",")[0].strip()
+                except Exception:
+                    pass
+
+            if "progress=" in low:
+                try:
+                    pstr = low.split("progress=", 1)[1]
+                    pnum = ""
+                    for ch in pstr:
+                        if ch.isdigit():
+                            pnum += ch
+                        else:
+                            break
+                    if pnum:
+                        p = int(pnum)
+                        progress_bucket = min(100, (p // 25) * 25)
+                except Exception:
+                    progress_bucket = None
+
+            return "poll:{}:{}".format(status, progress_bucket)
+
+        return s
 
     def set_status(self, text, write_log=False):
         self.status_label.setText(text)
@@ -3523,9 +3833,9 @@ class AIGenPanel(QtWidgets.QWidget):
             self.log(text)
         QtWidgets.QApplication.processEvents()
 
-    def set_status_and_log(self, text):
+    def set_status_and_log(self, text, level=LOG_INFO, tag="UI"):
         self.status_label.setText(text)
-        self.log(text)
+        self.log(text, level=level, tag=tag)
         QtWidgets.QApplication.processEvents()
 
     def current_output_dir(self, create=True):
@@ -4499,9 +4809,9 @@ class AIGenPanel(QtWidgets.QWidget):
         self.refresh_apply_button_from_selection()
 
         if removed:
-            self.log("已删除: {}".format(" | ".join([p for p in removed if p])))
+            self.log("已删除: {}".format(ui_join_paths(removed)), tag="FILE")
         else:
-            self.log("记录已移除，但没有找到可删除的文件")
+            self.log("记录已移除，但没有找到可删除的文件", level=LOG_WARN, tag="FILE")
 
         self.status_label.setText("已删除记录")
 
@@ -4563,6 +4873,25 @@ class AIGenPanel(QtWidgets.QWidget):
 
     def on_result_context_menu(self, pos):
         self.show_context_menu(self.result_list, pos)
+
+    def on_log_context_menu(self, pos):
+        menu = self.log_edit.createStandardContextMenu()
+        menu.addSeparator()
+
+        act_clear = menu.addAction("清空日志")
+        act_copy_all = menu.addAction("复制全部")
+
+        action = menu.exec(self.log_edit.mapToGlobal(pos))
+
+        if action == act_clear:
+            self.log_edit.clear()
+            self.status_label.setText("日志已清空")
+
+        elif action == act_copy_all:
+            text = self.log_edit.toPlainText()
+            if text:
+                QtWidgets.QApplication.clipboard().setText(text)
+                self.status_label.setText("日志已复制")
 
     def clear_list_selection(self, list_widget):
         list_widget.blockSignals(True)
@@ -4752,7 +5081,7 @@ class AIGenPanel(QtWidgets.QWidget):
                     record["meta_path"] = json_path
                     self.add_capture_item(record, select=False, prepend=False, lazy_icon=False)
                 except Exception as e:
-                    self.log("读取截图记录失败 {}: {}".format(json_path, e))
+                    self.log("读取截图记录失败 {}: {}".format(json_path, e), level=LOG_WARN, tag="GALLERY")
 
             for json_path in result_jsons:
                 try:
@@ -4762,14 +5091,14 @@ class AIGenPanel(QtWidgets.QWidget):
                     record["meta_path"] = json_path
                     self.add_result_item(record, select=False, prepend=False, lazy_icon=False)
                 except Exception as e:
-                    self.log("读取结果记录失败 {}: {}".format(json_path, e))
+                    self.log("读取结果记录失败 {}: {}".format(json_path, e), level=LOG_WARN, tag="GALLERY")
 
             self.refresh_apply_button_from_selection()
 
             if log_message:
-                self.log("图库已刷新")
+                self.log("图库已刷新", tag="GALLERY")
         except Exception as e:
-            self.log("加载缩略图失败: {}".format(e))
+            self.log("加载缩略图失败: {}".format(e), level=LOG_ERROR, tag="GALLERY")
 
     def on_mode_changed(self, text):
         self.update_mode_ui()
@@ -4933,7 +5262,7 @@ class AIGenPanel(QtWidgets.QWidget):
         self.add_capture_item(atlas_record, select=True, prepend=True, lazy_icon=False)
         self.switch_preview_tab(self.capture_page, keep_selection=True)
         self.status_label.setText("多视角截图与拼图完成")
-        self.log("多视角拼图记录已创建: {}".format(atlas_record["capture_path"]))
+        self.log("多视角输入已创建: {}".format(atlas_record["capture_path"]), tag="CAP")
         return atlas_record
 
     def capture_uvguide_and_build_composite(self):
@@ -5010,8 +5339,13 @@ class AIGenPanel(QtWidgets.QWidget):
             self.add_capture_item(record, select=True, prepend=True, lazy_icon=False)
             self.switch_preview_tab(self.capture_page, keep_selection=True)
             self.status_label.setText("UV主图 + 多视角参考图完成")
-            self.log("UV 主图已创建: {}".format(record["uv_layout_path"]))
-            self.log("多视角参考图已创建: {}".format(record["multiview_atlas_path"]))
+            self.log(
+                "UV 输入已创建: uv={} atlas={}".format(
+                    ui_path_text(record["uv_layout_path"]),
+                    ui_path_text(record["multiview_atlas_path"])
+                ),
+                tag="CAP"
+            )
             return record
 
         finally:
@@ -5041,7 +5375,7 @@ class AIGenPanel(QtWidgets.QWidget):
 
             if mode == MODE_PROMPT_ONLY:
                 self.status_label.setText("提示词生成模式无需截图，直接点击生成")
-                self.log("提示词生成模式无需截图")
+                self.log("提示词生成模式无需截图", tag="CAP")
                 return
 
             if mode == MODE_MULTI:
@@ -5074,11 +5408,11 @@ class AIGenPanel(QtWidgets.QWidget):
             )
             self.add_capture_item(record, select=True, prepend=True, lazy_icon=False)
             self.switch_preview_tab(self.capture_page, keep_selection=True)
-            self.log("截图完成: {}".format(record["capture_path"]))
+            self.log("截图完成: {}".format(ui_path_text(record["capture_path"])), tag="CAP")
             self.status_label.setText("截图完成")
 
         except Exception as e:
-            self.log(traceback.format_exc())
+            self.log(traceback.format_exc(), level=LOG_ERROR, tag="TRACE")
             self.preview_tabs.setCurrentWidget(self.log_page)
             self.set_status("截图失败: {}".format(e))
 
@@ -5094,6 +5428,7 @@ class AIGenPanel(QtWidgets.QWidget):
 
     def refresh_client_settings(self):
         self.settings_data = load_plugin_settings()
+        self._sync_log_runtime_settings()
         self.client = self.build_client_from_settings(self.settings_data)
 
         invalid_values = {"", "API_KEY", "YOUR_API_KEY", "None", "null"}
@@ -5146,8 +5481,7 @@ class AIGenPanel(QtWidgets.QWidget):
             output_dir = self.current_output_dir(create=True)
 
             if record.get("is_uv_result"):
-                self.log("检测到 UV 结果图，直接调用 AI 转法线")
-                self.log("准备进入 AI 生成阶段...")
+                self.log("开始转换法线[UV]", tag="NORMAL")
 
                 ctx = {
                     "mode": "normal_from_uv",
@@ -5165,7 +5499,7 @@ class AIGenPanel(QtWidgets.QWidget):
                 return
 
             if record.get("mode") == MODE_MULTI or record.get("is_multiview_result"):
-                self.log("检测到多视图结果图，先创建临时投射组，再导出颜色贴图，再调用 AI 转法线")
+                self.log("开始转换法线[多视角]", tag="NORMAL")
 
                 payload = self.build_apply_payload_from_result_record(record)
                 if not payload:
@@ -5175,7 +5509,7 @@ class AIGenPanel(QtWidgets.QWidget):
                 if not isinstance(manifest, dict):
                     raise RuntimeError("多视图 manifest 不存在")
 
-                self.set_status_and_log("正在切分多视图结果...")
+                self.set_status("正在切分多视图结果...")
                 split_dir = os.path.splitext(result_path)[0] + "_tiles"
                 split_tiles, split_manifest_path = split_multiview_result_by_manifest(
                     result_image_path=result_path,
@@ -5183,26 +5517,24 @@ class AIGenPanel(QtWidgets.QWidget):
                     output_dir=split_dir
                 )
 
-                self.log("多视图结果已切图，共 {} 张".format(len(split_tiles)))
+                self.log("多视角切图完成: {} 张".format(len(split_tiles)), tag="NORMAL")
+                log_debug("NORMAL", "split_manifest={}".format(split_manifest_path))
 
-                self.set_status_and_log("正在创建临时投射组...")
+                self.set_status("正在创建临时投射组...")
                 temp_group = self.create_multiview_projection_group(
                     split_tiles=split_tiles,
                     group_name="AI_NormalBake_Temp_{}".format(time.strftime("%H%M%S"))
                 )
 
-                self.log("临时投射组已创建")
-                self.log("切图信息: {}".format(split_manifest_path))
-
-                self.set_status_and_log("正在导出颜色贴图...")
+                self.set_status("正在导出颜色贴图...")
                 temp_export_path, temp_export_dir = self.export_active_basecolor_map(output_dir)
+                self.log("BaseColor 导出完成: {}".format(temp_export_path), tag="NORMAL")
 
-                self.set_status_and_log("正在清理临时投射组...")
+                self.set_status("正在清理临时投射组...")
                 self.remove_group_safe(temp_group)
                 temp_group = None
 
-                self.log("颜色贴图导出完成: {}".format(temp_export_path))
-                self.log("准备进入 AI 生成阶段...")
+                self.log("开始 AI 法线生成", tag="NORMAL")
 
                 ctx = {
                     "mode": "normal_from_multiview",
@@ -5223,8 +5555,7 @@ class AIGenPanel(QtWidgets.QWidget):
                 return
 
             if record.get("mode") == MODE_SINGLE:
-                self.log("检测到单视角结果图，直接调用 AI 转细节法线")
-                self.log("准备进入 AI 生成阶段...")
+                self.log("开始转换法线[单视角]", tag="NORMAL")
 
                 ctx = {
                     "mode": "normal_from_single",
@@ -5242,6 +5573,32 @@ class AIGenPanel(QtWidgets.QWidget):
                 return
 
             raise RuntimeError("当前结果类型不支持转换为法线")
+
+        except Exception as e:
+            if temp_group is not None:
+                try:
+                    self.remove_group_safe(temp_group)
+                except Exception:
+                    pass
+
+            if temp_export_path:
+                safe_remove(temp_export_path)
+
+            if temp_export_dir and os.path.isdir(temp_export_dir):
+                try:
+                    shutil.rmtree(temp_export_dir, ignore_errors=True)
+                except Exception:
+                    pass
+
+            if split_dir and os.path.isdir(split_dir):
+                try:
+                    shutil.rmtree(split_dir, ignore_errors=True)
+                except Exception:
+                    pass
+
+            self.log(traceback.format_exc(), level=LOG_ERROR, tag="TRACE")
+            self.preview_tabs.setCurrentWidget(self.log_page)
+            self.set_status("转换法线失败: {}".format(e))
 
         except Exception as e:
             if temp_group is not None:
@@ -5365,9 +5722,12 @@ class AIGenPanel(QtWidgets.QWidget):
 
         fixed_image_size = self.normalize_model_image_size(model, image_size)
         if fixed_image_size != image_size:
-            self.log("检测到模型 {} 不兼容分辨率 {}，已自动调整为 {}".format(
-                model, image_size, fixed_image_size
-            ))
+            self.log(
+                "检测到模型 {} 不兼容分辨率 {}，已自动调整为 {}".format(
+                    model, image_size, fixed_image_size
+                ),
+                tag="GEN"
+            )
             image_size = fixed_image_size
 
         output_dir = self.current_output_dir(create=True)
@@ -5377,19 +5737,46 @@ class AIGenPanel(QtWidgets.QWidget):
             submit_image_paths = [capture_path]
 
         record_capture_path = str(ctx.get("record_capture_path", capture_path or "") or "").strip()
+        mode_name = str(ctx.get("mode", "") or "unknown")
+        provider = self.settings_data.get("provider", "")
 
-        self.log("生成参数: provider={}".format(self.settings_data.get("provider", "")))
-        self.log("生成参数: model={}".format(model))
-        self.log("生成参数: aspect_ratio={}".format(aspect_ratio))
-        self.log("生成参数: image_size={}".format(image_size))
-        self.log("生成参数: submit_image_count={}".format(len(submit_image_paths)))
-        self.log("生成参数: use_data_url_prefix={}".format(
-            getattr(self.client, "use_data_url_prefix", None)
-        ))
+        self.log(
+            "开始生成: mode={} provider={} model={} size={} aspect={} images={}".format(
+                mode_name, provider, model, image_size, aspect_ratio, len(submit_image_paths)
+            ),
+            tag="GEN"
+        )
 
-        for idx, p in enumerate(submit_image_paths):
+        capture_desc = "-"
+        if capture_path and os.path.exists(capture_path):
+            w, h = get_image_size_safe(capture_path)
+            capture_desc = "{}({}x{})".format(os.path.basename(capture_path), w, h)
+
+        ref_descs = []
+        seen = set()
+        ref_paths = list(ctx.get("reference_image_paths", []))
+
+        for p in ref_paths:
+            p = str(p or "").strip()
+            if not p or not os.path.exists(p):
+                continue
+
+            norm = normalize_path_str(p)
+            if norm in seen:
+                continue
+            seen.add(norm)
+
             w, h = get_image_size_safe(p)
-            self.log("提交图[{}]: {} | {}x{}".format(idx, p, w, h))
+            ref_descs.append("{}({}x{})".format(os.path.basename(p), w, h))
+
+        if capture_desc != "-" or ref_descs:
+            self.log(
+                "输入图: capture={} refs={}".format(
+                    capture_desc,
+                    ", ".join(ref_descs) if ref_descs else "0"
+                ),
+                tag="GEN"
+            )
 
         def progress_cb(text):
             self.gen_queue.put({
@@ -5408,7 +5795,8 @@ class AIGenPanel(QtWidgets.QWidget):
 
                 for attempt in range(1, max_attempts + 1):
                     try:
-                        progress_cb("正在提交 nano-banana... ({}/{})".format(attempt, max_attempts))
+                        if attempt > 1:
+                            progress_cb("提交失败，正在重试({}/{})...".format(attempt, max_attempts))
 
                         if submit_image_paths:
                             if len(submit_image_paths) == 1:
@@ -5456,7 +5844,7 @@ class AIGenPanel(QtWidgets.QWidget):
                         if attempt >= max_attempts or not self.is_retryable_generate_error(err_text):
                             raise
 
-                        progress_cb("检测到可重试错误，准备重试: {}".format(err_text))
+                        progress_cb("检测到可重试错误: {}".format(err_text))
 
                         wait_left = 2.0
                         while wait_left > 0:
@@ -5571,9 +5959,10 @@ class AIGenPanel(QtWidgets.QWidget):
                 text = msg.get("text", "处理中...")
                 self.set_status(text)
 
-                if text != self._last_progress_log_text:
-                    self.log(text)
-                    self._last_progress_log_text = text
+                key = self._normalize_progress_log_key(text)
+                if key != self._last_progress_log_text:
+                    self.log(text, tag="GEN")
+                    self._last_progress_log_text = key
 
             elif mtype == "error":
                 ctx = self.pending_job_context or {}
@@ -5585,7 +5974,7 @@ class AIGenPanel(QtWidgets.QWidget):
                 self.gen_thread = None
                 self.gen_poll_timer.stop()
                 self.set_ui_busy(False)
-                self.log(msg.get("trace", ""))
+                self.log(msg.get("trace", ""), level=LOG_ERROR, tag="TRACE")
                 self.preview_tabs.setCurrentWidget(self.log_page)
                 self.set_status("生成失败: {}".format(msg.get("text", "unknown")))
                 return
@@ -5657,10 +6046,6 @@ class AIGenPanel(QtWidgets.QWidget):
                     has_capture=False
                 )
 
-                self.log("提示词生成模式")
-                if ref_paths:
-                    self.log("附加参考图 {} 张".format(len(ref_paths)))
-
                 self.start_background_generate(
                     capture_path=None,
                     input_image_paths=ref_paths if ref_paths else None,
@@ -5709,18 +6094,6 @@ class AIGenPanel(QtWidgets.QWidget):
 
                 uv_aspect_ratio = "1:1"
 
-                self.log("UV 模式生成（UV主图 + 多视角参考图）")
-                self.log("UV 主图尺寸: {}x{}".format(*get_image_size_safe(uv_layout_path)))
-                self.log("多视角参考图尺寸: {}x{}".format(*get_image_size_safe(multiview_atlas_path)))
-                self.log("UV 输出比例: {}".format(uv_aspect_ratio))
-                self.log("提交图像数: {}".format(len(submit_paths)))
-                for idx, p in enumerate(submit_paths):
-                    w, h = get_image_size_safe(p)
-                    self.log("  [{}] {} | {}x{}".format(idx, p, w, h))
-
-                if ref_paths:
-                    self.log("附加用户参考图 {} 张".format(len(ref_paths)))
-
                 ctx = {
                     "mode": MODE_UV_GUIDE,
                     "reference_image_paths": list(ref_paths),
@@ -5745,12 +6118,6 @@ class AIGenPanel(QtWidgets.QWidget):
                 if not manifest:
                     raise RuntimeError("多视角 manifest 不存在")
 
-                self.log("多视角模式生成")
-                self.log("多视角输入尺寸: {}x{}".format(*get_image_size_safe(capture_path)))
-                self.log("多视角比例策略: auto")
-                if ref_paths:
-                    self.log("附加参考图 {} 张".format(len(ref_paths)))
-
                 ctx = {
                     "mode": MODE_MULTI,
                     "reference_image_paths": list(ref_paths),
@@ -5769,10 +6136,6 @@ class AIGenPanel(QtWidgets.QWidget):
             camera_state = selected_record.get("camera_state")
             if not camera_state:
                 raise RuntimeError("单视角截图缺少 camera_state，无法按单视角生成")
-
-            self.log("单视角模式生成")
-            if ref_paths:
-                self.log("附加参考图 {} 张".format(len(ref_paths)))
 
             ctx = {
                 "mode": MODE_SINGLE,
@@ -5833,7 +6196,7 @@ class AIGenPanel(QtWidgets.QWidget):
                     write_json(record["meta_path"], record)
                     result_path = record["result_path"]
                 except Exception as e:
-                    self.log("单视角结果裁切失败，保留整图结果: {}".format(e))
+                    self.log("单视角结果裁切失败，保留整图结果: {}".format(e), level=LOG_WARN, tag="GEN")
 
             item = self.add_result_item(record, select=False, prepend=True, lazy_icon=False)
 
@@ -5843,7 +6206,7 @@ class AIGenPanel(QtWidgets.QWidget):
                 self.result_list.setCurrentItem(item)
                 self.preview_record(record)
 
-            self.log("生成完成，保存于: {}".format(result_path))
+            self.log("生成完成: {}".format(result_path), tag="GEN")
             self.status_label.setText("生成完成")
             self.refresh_apply_button_from_selection()
 
@@ -5938,9 +6301,9 @@ class AIGenPanel(QtWidgets.QWidget):
 
         ok = self.delete_layerstack_node_safe(group)
         if ok:
-            self.log("已清理临时组")
+            self.log("已清理临时组", tag="LAYER")
         else:
-            self.log("警告：临时组删除失败，请手动检查图层栈")
+            self.log("警告：临时组删除失败，请手动检查图层栈", level=LOG_WARN, tag="LAYER")
 
     def set_fill_bitmap_source_channel(self, fill_node, channel_type, resource_id):
         active = set(fill_node.active_channels)
@@ -6092,8 +6455,8 @@ class AIGenPanel(QtWidgets.QWidget):
         )
 
         self.status_label.setText("多视角投射层已创建")
-        self.log("多视角结果已应用到 Painter")
-        self.log("切图信息: {}".format(split_manifest_path))
+        self.log("多视角结果已应用到 Painter", tag="APPLY")
+        log_debug("APPLY", "split_manifest={}".format(split_manifest_path))
         return group
 
     def apply_single_result_to_painter(self, record):
@@ -6129,7 +6492,7 @@ class AIGenPanel(QtWidgets.QWidget):
             fill.set_projection_parameters(self.make_planar_params_for_slot("front", anchor=anchor))
 
         self.status_label.setText("单视角投射层已创建")
-        self.log("单视角结果已应用到 Painter")
+        self.log("单视角结果已应用到 Painter", tag="APPLY")
 
     def apply_uv_result_to_painter(self, record):
         if sp_layerstack is None or sp_textureset is None:
@@ -6159,7 +6522,7 @@ class AIGenPanel(QtWidgets.QWidget):
                 pass
 
         self.status_label.setText("UV 贴图层已创建")
-        self.log("UV 结果已作为 UV 贴图应用到 Painter")
+        self.log("UV 结果已作为 UV 贴图应用到 Painter", tag="APPLY")
 
     def apply_normal_result_to_painter(self, record):
         if sp_layerstack is None or sp_textureset is None:
@@ -6189,7 +6552,7 @@ class AIGenPanel(QtWidgets.QWidget):
                 pass
 
         self.status_label.setText("法线贴图层已创建")
-        self.log("法线结果已应用到 Painter")
+        self.log("法线结果已应用到 Painter", tag="APPLY")
 
     def apply_payload_internal(self, payload):
         if payload.get("mode") == MODE_MULTI:
@@ -6229,7 +6592,7 @@ class AIGenPanel(QtWidgets.QWidget):
             self.refresh_apply_button_from_selection()
 
         except Exception as e:
-            self.log(traceback.format_exc())
+            self.log(traceback.format_exc(), level=LOG_ERROR, tag="TRACE")
             self.pending_apply_payload = payload
             self.apply_btn.setEnabled(True)
             self.preview_tabs.setCurrentWidget(self.log_page)
@@ -6252,10 +6615,10 @@ class AIGenPanel(QtWidgets.QWidget):
         try:
             output_dir = self.current_output_dir(create=True)
             QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(output_dir))
-            self.log("已打开输出目录: {}".format(output_dir))
+            self.log("已打开输出目录: {}".format(output_dir), tag="FILE")
             self.status_label.setText("已打开输出目录")
         except Exception as e:
-            self.log(traceback.format_exc())
+            self.log(traceback.format_exc(), level=LOG_ERROR, tag="TRACE")
             self.preview_tabs.setCurrentWidget(self.log_page)
             self.set_status("打开目录失败: {}".format(e))
 
