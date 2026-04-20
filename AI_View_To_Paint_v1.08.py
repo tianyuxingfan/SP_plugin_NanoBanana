@@ -4032,7 +4032,7 @@ class AIGenPanel(QtWidgets.QWidget):
     def capture_current_view(self):
         return self.capture_viewport_widget()
 
-    def tap_f2(self, wait_ms=120):
+    def tap_key(self, key, wait_ms=180, prefer_viewport=True):
         main_window = substance_painter.ui.get_main_window()
         if main_window is None:
             return False
@@ -4040,32 +4040,75 @@ class AIGenPanel(QtWidgets.QWidget):
         try:
             main_window.raise_()
             main_window.activateWindow()
-            main_window.setFocus(QtCore.Qt.FocusReason.ActiveWindowFocusReason)
             QtWidgets.QApplication.processEvents()
+
+            target = self.find_viewport_widget() if prefer_viewport else None
+            if target is None:
+                target = main_window
+
+            try:
+                target.setFocus(QtCore.Qt.FocusReason.ActiveWindowFocusReason)
+            except Exception:
+                pass
+
+            QtWidgets.QApplication.processEvents()
+            QtCore.QThread.msleep(40)
 
             press_event = QtGui.QKeyEvent(
                 QtCore.QEvent.Type.KeyPress,
-                QtCore.Qt.Key.Key_F2,
+                key,
                 QtCore.Qt.KeyboardModifier.NoModifier
             )
             release_event = QtGui.QKeyEvent(
                 QtCore.QEvent.Type.KeyRelease,
-                QtCore.Qt.Key.Key_F2,
+                key,
                 QtCore.Qt.KeyboardModifier.NoModifier
             )
 
-            QtWidgets.QApplication.sendEvent(main_window, press_event)
-            QtWidgets.QApplication.processEvents()
-            QtWidgets.QApplication.sendEvent(main_window, release_event)
-            QtWidgets.QApplication.processEvents()
+            ok = False
+
+            try:
+                QtWidgets.QApplication.sendEvent(target, press_event)
+                QtWidgets.QApplication.processEvents()
+                QtWidgets.QApplication.sendEvent(target, release_event)
+                QtWidgets.QApplication.processEvents()
+                ok = True
+            except Exception:
+                ok = False
+
+            if target is not main_window:
+                try:
+                    press_event2 = QtGui.QKeyEvent(
+                        QtCore.QEvent.Type.KeyPress,
+                        key,
+                        QtCore.Qt.KeyboardModifier.NoModifier
+                    )
+                    release_event2 = QtGui.QKeyEvent(
+                        QtCore.QEvent.Type.KeyRelease,
+                        key,
+                        QtCore.Qt.KeyboardModifier.NoModifier
+                    )
+                    QtWidgets.QApplication.sendEvent(main_window, press_event2)
+                    QtWidgets.QApplication.processEvents()
+                    QtWidgets.QApplication.sendEvent(main_window, release_event2)
+                    QtWidgets.QApplication.processEvents()
+                    ok = True
+                except Exception:
+                    pass
 
             QtCore.QThread.msleep(max(0, int(wait_ms)))
-            self._flush_viewport_frames(frame_count=2, frame_sleep_ms=33)
-            return True
+            self._flush_viewport_frames(frame_count=4, frame_sleep_ms=33)
+            return ok
 
         except Exception as e:
-            self.log("模拟 F2 失败: {}".format(e))
+            self.log("模拟按键失败: key={} err={}".format(int(key), e))
             return False
+
+    def tap_f2(self, wait_ms=120):
+        return self.tap_key(QtCore.Qt.Key.Key_F2, wait_ms=wait_ms, prefer_viewport=False)
+
+    def tap_f(self, wait_ms=220):
+        return self.tap_key(QtCore.Qt.Key.Key_F, wait_ms=wait_ms, prefer_viewport=True)
 
     def has_camera_api(self):
         try:
@@ -4168,37 +4211,40 @@ class AIGenPanel(QtWidgets.QWidget):
         except Exception:
             return [1.0, 1.0, 1.0]
 
-    def _make_camera_state_from_view(self, view_name, ortho=True, fit_scale=2.4):
-        bbox = self.get_scene_bbox_safe()
-        if bbox is None:
-            raise RuntimeError("无法获取场景包围盒")
-
-        center, radius = self._bbox_center_radius(bbox)
-        dist = max(radius * fit_scale, 0.1)
-
-        positions = {
-            "front": [center[0], center[1], center[2] - dist],
-            "back": [center[0], center[1], center[2] + dist],
-            "left": [center[0] - dist, center[1], center[2]],
-            "right": [center[0] + dist, center[1], center[2]],
-            "top": [center[0], center[1] - dist, center[2]],
-            "bottom": [center[0], center[1] + dist, center[2]],
-        }
-
-        if view_name not in positions:
+    def _make_camera_state_from_view(self, view_name, ortho=True, fit_scale=1.0):
+        if view_name not in MULTIVIEW_ROT_PRESETS:
             raise RuntimeError("未知视角: {}".format(view_name))
+
+        base_state = self.get_camera_state_safe() or {}
+
+        position = list(base_state.get("position", [0.0, 0.0, 0.0]))
+        focus_distance = float(base_state.get("focus_distance", 1.0) or 1.0)
+        focal_length = float(base_state.get("focal_length", 50.0) or 50.0)
+        field_of_view = float(base_state.get("field_of_view", 35.0) or 35.0)
+        aperture = float(base_state.get("aperture", 0.0) or 0.0)
+
+        orthographic_height = float(base_state.get("orthographic_height", 2.0) or 2.0)
+        if orthographic_height <= 1e-6:
+            orthographic_height = 2.0
 
         rotation = list(MULTIVIEW_ROT_PRESETS.get(view_name, [0.0, 0.0, 0.0]))
 
+        self.log(
+            "视角={} 使用当前相机基态切换方向 position={} ortho_h={:.4f}".format(
+                view_name, position, orthographic_height
+            ),
+            tag="CAM"
+        )
+
         return {
-            "position": positions[view_name],
+            "position": position,
             "rotation": rotation,
-            "projection_type": "Orthographic" if ortho else "Perspective",
-            "field_of_view": 35.0,
-            "focal_length": 50.0,
-            "focus_distance": dist,
-            "aperture": 0.0,
-            "orthographic_height": radius * 2.4,
+            "projection_type": "Orthographic" if ortho else str(base_state.get("projection_type", "Perspective")),
+            "field_of_view": field_of_view,
+            "focal_length": focal_length,
+            "focus_distance": focus_distance,
+            "aperture": aperture,
+            "orthographic_height": orthographic_height,
         }
 
     def _clamp(self, value, mn, mx):
@@ -5210,16 +5256,22 @@ class AIGenPanel(QtWidgets.QWidget):
         try:
             for slot_name, slot_label in defs:
                 self.set_status("自动采集视角: {}".format(slot_label))
-                self.tap_f2()
-                state = self._make_camera_state_from_view(slot_name, ortho=True, fit_scale=2.4)
-                self.apply_camera_state_and_wait(state, timeout_ms=1500)
-                self._flush_viewport_frames(frame_count=2, frame_sleep_ms=40)
+
+                self.tap_f2(wait_ms=120)
+
+                state = self._make_camera_state_from_view(slot_name, ortho=True)
+                self.apply_camera_state_and_wait(state, timeout_ms=1200)
+
+                self.tap_f(wait_ms=220)
+
+                self._flush_viewport_frames(frame_count=3, frame_sleep_ms=40)
+                final_camera_state = self.get_camera_state_safe() or state
                 pixmap = self.capture_current_view()
 
                 rec = self.save_capture_record(
                     pixmap=pixmap,
                     output_dir=output_dir,
-                    camera_state=state,
+                    camera_state=final_camera_state,
                     extra={
                         "slot_name": slot_name,
                         "slot_label": slot_label,
@@ -5227,6 +5279,7 @@ class AIGenPanel(QtWidgets.QWidget):
                     }
                 )
                 temp_records.append(rec)
+
         finally:
             if original_camera:
                 self.apply_camera_state_and_wait(original_camera, timeout_ms=1000)
@@ -5281,16 +5334,22 @@ class AIGenPanel(QtWidgets.QWidget):
         try:
             for slot_name, slot_label in defs:
                 self.set_status("采集 {}".format(slot_label))
-                self.tap_f2()
-                state = self._make_camera_state_from_view(slot_name, ortho=True, fit_scale=2.4)
-                self.apply_camera_state_and_wait(state, timeout_ms=1500)
-                self._flush_viewport_frames(frame_count=2, frame_sleep_ms=40)
+
+                self.tap_f2(wait_ms=120)
+
+                state = self._make_camera_state_from_view(slot_name, ortho=True)
+                self.apply_camera_state_and_wait(state, timeout_ms=1200)
+
+                self.tap_f(wait_ms=220)
+
+                self._flush_viewport_frames(frame_count=3, frame_sleep_ms=40)
+                final_camera_state = self.get_camera_state_safe() or state
                 pixmap = self.capture_current_view()
 
                 rec = self.save_capture_record(
                     pixmap=pixmap,
                     output_dir=output_dir,
-                    camera_state=state,
+                    camera_state=final_camera_state,
                     extra={
                         "slot_name": slot_name,
                         "slot_label": slot_label,
@@ -5597,32 +5656,6 @@ class AIGenPanel(QtWidgets.QWidget):
                     pass
 
             self.log(traceback.format_exc(), level=LOG_ERROR, tag="TRACE")
-            self.preview_tabs.setCurrentWidget(self.log_page)
-            self.set_status("转换法线失败: {}".format(e))
-
-        except Exception as e:
-            if temp_group is not None:
-                try:
-                    self.remove_group_safe(temp_group)
-                except Exception:
-                    pass
-
-            if temp_export_path:
-                safe_remove(temp_export_path)
-
-            if temp_export_dir and os.path.isdir(temp_export_dir):
-                try:
-                    shutil.rmtree(temp_export_dir, ignore_errors=True)
-                except Exception:
-                    pass
-
-            if split_dir and os.path.isdir(split_dir):
-                try:
-                    shutil.rmtree(split_dir, ignore_errors=True)
-                except Exception:
-                    pass
-
-            self.log(traceback.format_exc())
             self.preview_tabs.setCurrentWidget(self.log_page)
             self.set_status("转换法线失败: {}".format(e))
 
