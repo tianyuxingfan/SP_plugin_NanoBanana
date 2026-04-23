@@ -47,10 +47,21 @@ except Exception:
 from PySide6 import QtWidgets, QtCore, QtGui
 
 API_BASE = "https://grsai.dakka.com.cn"
+
 SUBMIT_PATH = "/v1/draw/nano-banana"
+GPT_IMAGE_SUBMIT_PATH = "/v1/draw/completions"
 RESULT_PATH = "/v1/draw/result"
 
+DEFAULT_MODEL = "gpt-image-2"
+DEFAULT_ASPECT_RATIO = "auto"
+DEFAULT_IMAGE_SIZE = "2K"
+
 DEFAULT_MODEL = "nano-banana-2"
+ALLOWED_MODELS = [
+    "nano-banana-pro",
+    "nano-banana-2",
+    "gpt-image-2",
+]
 DEFAULT_ASPECT_RATIO = "auto"
 DEFAULT_IMAGE_SIZE = "2K"
 
@@ -362,6 +373,8 @@ def sanitize_headers(headers):
     return out
 
 
+
+
 def basename_list(paths, max_count=4):
     arr = []
     src = list(paths or [])
@@ -479,7 +492,10 @@ def merge_plugin_settings(data=None):
     settings["auth_mode"] = str(settings.get("auth_mode", preset.get("auth_mode", "bearer")) or "bearer").strip().lower()
     settings["submit_path"] = normalize_api_path(settings.get("submit_path"), preset.get("submit_path", SUBMIT_PATH))
     settings["result_path"] = normalize_api_path(settings.get("result_path"), preset.get("result_path", RESULT_PATH))
-    settings["default_model"] = str(settings.get("default_model", DEFAULT_MODEL) or DEFAULT_MODEL).strip()
+    default_model = str(settings.get("default_model", DEFAULT_MODEL) or DEFAULT_MODEL).strip()
+    if default_model not in ALLOWED_MODELS:
+        default_model = DEFAULT_MODEL
+    settings["default_model"] = default_model
     settings["default_image_size"] = str(settings.get("default_image_size", DEFAULT_IMAGE_SIZE) or DEFAULT_IMAGE_SIZE).strip()
     settings["output_dir"] = str(settings.get("output_dir", DEFAULT_OUTPUT_DIR) or DEFAULT_OUTPUT_DIR).strip()
 
@@ -1852,6 +1868,25 @@ class NanoBananaClient(object):
 
         return headers
 
+    def is_gpt_image_model(self, model):
+        return str(model or "").strip().lower() == "gpt-image-2"
+
+    def get_submit_path_by_model(self, model):
+        if self.is_gpt_image_model(model):
+            return GPT_IMAGE_SUBMIT_PATH
+        return self.submit_path
+
+    def normalize_aspect_ratio_for_gpt_image(self, aspect_ratio):
+        text = str(aspect_ratio or "").strip().lower()
+        allowed = {
+            "auto", "1:1", "3:2", "2:3", "16:9", "9:16",
+            "5:4", "4:5", "4:3", "3:4", "21:9", "9:21",
+            "1:3", "3:1", "2:1", "1:2"
+        }
+        if text in allowed:
+            return text
+        return "auto"
+
     def prepare_upload_image_bytes_and_mime(self, image_path, max_side=1536):
         try:
             image = QtGui.QImage(image_path)
@@ -1945,21 +1980,33 @@ class NanoBananaClient(object):
         if cancel_cb and cancel_cb():
             raise RuntimeError("已取消")
 
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "aspectRatio": aspect_ratio,
-            "imageSize": image_size,
-            "webHook": "-1",
-            "shutProgress": shut_progress
-        }
+        model = str(model or "").strip()
+        submit_path = self.get_submit_path_by_model(model)
+
+        if self.is_gpt_image_model(model):
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "size": self.normalize_aspect_ratio_for_gpt_image(aspect_ratio),
+                "webHook": "-1",
+                "shutProgress": shut_progress
+            }
+        else:
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "aspectRatio": aspect_ratio,
+                "imageSize": image_size,
+                "webHook": "-1",
+                "shutProgress": shut_progress
+            }
 
         if urls:
             payload["urls"] = urls
 
-        url = self.api_base + self.submit_path
+        url = self.api_base + submit_path
 
-        log_info("API", "提交任务: provider=grsai images={}".format(len(urls or [])))
+        log_info("API", "提交任务: provider=grsai model={} images={}".format(model, len(urls or [])))
         log_debug("API", "GRSAI submit url={} model={} size={} aspect={}".format(
             url, model, image_size, aspect_ratio
         ))
@@ -3318,14 +3365,45 @@ class AIGenPanel(QtWidgets.QWidget):
         self.output_dir_edit.setText(output_dir)
 
         model = self.settings_data.get("default_model", DEFAULT_MODEL)
-        if self.model_combo.findText(model) < 0:
-            self.model_combo.addItem(model)
+        if model not in ALLOWED_MODELS:
+            model = DEFAULT_MODEL
         self.model_combo.setCurrentText(model)
 
-        image_size = self.settings_data.get("default_image_size", DEFAULT_IMAGE_SIZE)
-        if self.size_combo.findText(image_size) < 0:
-            self.size_combo.addItem(image_size)
-        self.size_combo.setCurrentText(image_size)
+        self.update_size_combo_state()
+
+    def update_size_combo_state(self):
+        model = self.model_combo.currentText().strip().lower()
+        is_gpt_image = (model == "gpt-image-2")
+
+        self.size_combo.blockSignals(True)
+        try:
+            if is_gpt_image:
+                self.size_combo.setEnabled(False)
+
+                if self.size_combo.findText("默认") < 0:
+                    self.size_combo.addItem("默认")
+
+                self.size_combo.setCurrentText("默认")
+            else:
+                if self.size_combo.findText("1K") < 0:
+                    self.size_combo.addItem("1K")
+                if self.size_combo.findText("2K") < 0:
+                    self.size_combo.addItem("2K")
+                if self.size_combo.findText("4K") < 0:
+                    self.size_combo.addItem("4K")
+
+                self.size_combo.setEnabled(True)
+
+                current_size = str(
+                    self.settings_data.get("default_image_size", DEFAULT_IMAGE_SIZE) or DEFAULT_IMAGE_SIZE
+                ).strip().upper()
+
+                if current_size not in ("1K", "2K", "4K"):
+                    current_size = DEFAULT_IMAGE_SIZE
+
+                self.size_combo.setCurrentText(current_size)
+        finally:
+            self.size_combo.blockSignals(False)
 
     def persist_output_dir_setting(self):
         self.settings_data = merge_plugin_settings(dict(self.settings_data, **{
@@ -3382,16 +3460,9 @@ class AIGenPanel(QtWidgets.QWidget):
 
         self.model_combo = QtWidgets.QComboBox()
         self.model_combo.addItems([
+            "gpt-image-2",
             "nano-banana-2",
-            "nano-banana-fast",
-            "nano-banana",
             "nano-banana-pro",
-            "nano-banana-pro-vt",
-            "nano-banana-pro-cl",
-            "nano-banana-pro-vip",
-            "nano-banana-2-cl",
-            "nano-banana-2-4k-cl",
-            "nano-banana-pro-4k-vip",
         ])
         self.model_combo.setCurrentText(DEFAULT_MODEL)
         self.model_combo.setSizePolicy(
@@ -3582,6 +3653,7 @@ class AIGenPanel(QtWidgets.QWidget):
         self.open_dir_btn.clicked.connect(self.on_open_dir_clicked)
         self.output_dir_edit.editingFinished.connect(self.on_output_dir_changed)
         self.size_combo.currentTextChanged.connect(self.on_image_size_changed)
+        self.model_combo.currentTextChanged.connect(self.on_model_changed)
 
         self.capture_list.itemDoubleClicked.connect(self.on_capture_item_double_clicked)
         self.result_list.itemDoubleClicked.connect(self.on_result_item_double_clicked)
@@ -5694,42 +5766,18 @@ class AIGenPanel(QtWidgets.QWidget):
         return any(k in text for k in keys)
 
     def normalize_model_image_size(self, model, image_size):
-        model = str(model or "").strip()
+        model = str(model or "").strip().lower()
         image_size = str(image_size or "").strip().upper()
 
-        allowed_map = {
-            "nano-banana-2-cl": ["1K", "2K"],
-            "nano-banana-2-4k-cl": ["4K"],
-            "nano-banana-pro-vip": ["1K", "2K"],
-            "nano-banana-pro-4k-vip": ["4K"],
-        }
+        if model in ("nano-banana-pro", "nano-banana-2"):
+            if image_size in ("1K", "2K", "4K"):
+                return image_size
+            return "2K"
 
-        allowed = allowed_map.get(model)
-        if not allowed:
+        if model == "gpt-image-2":
             return image_size
 
-        if image_size in allowed:
-            return image_size
-
-        if image_size == "4K":
-            if "2K" in allowed:
-                return "2K"
-            if "1K" in allowed:
-                return "1K"
-
-        if image_size == "2K":
-            if "1K" in allowed:
-                return "1K"
-            if "4K" in allowed:
-                return "4K"
-
-        if image_size == "1K":
-            if "2K" in allowed:
-                return "2K"
-            if "4K" in allowed:
-                return "4K"
-
-        return allowed[0]
+        return image_size
 
     def start_background_generate(self, capture_path=None, input_image_paths=None, camera_state=None, ctx=None,
                                   prompt_override=None, aspect_ratio_override=None):
@@ -6661,8 +6709,24 @@ class AIGenPanel(QtWidgets.QWidget):
         self.reload_galleries(log_message=True)
 
     def on_image_size_changed(self, text):
+        value = (text or "").strip().upper()
+        if value not in ("1K", "2K", "4K"):
+            return
+
         self.settings_data = merge_plugin_settings(dict(self.settings_data, **{
-            "default_image_size": (text or "").strip() or DEFAULT_IMAGE_SIZE
+            "default_image_size": value
+        }))
+        save_plugin_settings(self.settings_data)
+
+    def on_model_changed(self, text):
+        self.update_size_combo_state()
+
+        model = str(text or "").strip()
+        if model not in ALLOWED_MODELS:
+            model = DEFAULT_MODEL
+
+        self.settings_data = merge_plugin_settings(dict(self.settings_data, **{
+            "default_model": model
         }))
         save_plugin_settings(self.settings_data)
 
