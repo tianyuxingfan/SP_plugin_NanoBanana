@@ -24,4 +24,4 @@ API eky 在设置界面填写即可
 
 1.09版本更新 ：增加gpt-image-2模型，去掉一些不常用价格贵的模型
 
-1.10版本更新 ：https://grsai.ai/网站接口变更，代码接口更新，添加gpt-image-2-vip模型
+1.10版本更新 ：https://grsai.ai/  网站接口变更，代码接口更新，添加gpt-image-2-vip模型
