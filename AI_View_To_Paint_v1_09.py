@@ -48,22 +48,19 @@ from PySide6 import QtWidgets, QtCore, QtGui
 
 API_BASE = "https://grsai.dakka.com.cn"
 
-SUBMIT_PATH = "/v1/draw/nano-banana"
-GPT_IMAGE_SUBMIT_PATH = "/v1/draw/completions"
-RESULT_PATH = "/v1/draw/result"
-
-DEFAULT_MODEL = "gpt-image-2"
-DEFAULT_ASPECT_RATIO = "auto"
-DEFAULT_IMAGE_SIZE = "2K"
+SUBMIT_PATH = "/v1/api/generate"
+RESULT_PATH = "/v1/api/result"
 
 DEFAULT_MODEL = "nano-banana-2"
-ALLOWED_MODELS = [
-    "nano-banana-pro",
-    "nano-banana-2",
-    "gpt-image-2",
-]
 DEFAULT_ASPECT_RATIO = "auto"
 DEFAULT_IMAGE_SIZE = "2K"
+
+ALLOWED_MODELS = [
+    "nano-banana-2",
+    "nano-banana-pro",
+    "gpt-image-2",
+    "gpt-image-2-vip",
+]
 
 DEFAULT_POLL_INTERVAL = 1.5
 DEFAULT_POLL_TIMEOUT = 300
@@ -85,8 +82,8 @@ PROVIDER_PRESETS = {
     PROVIDER_GRSAI: {
         "label": "GRSAI",
         "api_base": "https://grsai.dakka.com.cn",
-        "submit_path": "/v1/draw/nano-banana",
-        "result_path": "/v1/draw/result",
+        "submit_path": "/v1/api/generate",
+        "result_path": "/v1/api/result",
         "auth_mode": "bearer",
     },
     PROVIDER_RUNNINGHUB: {
@@ -111,7 +108,7 @@ DEFAULT_SETTINGS = {
     "default_image_size": DEFAULT_IMAGE_SIZE,
     "poll_interval": DEFAULT_POLL_INTERVAL,
     "poll_timeout": DEFAULT_POLL_TIMEOUT,
-    "use_data_url_prefix": True,
+    "use_data_url_prefix": False,
     "output_dir": DEFAULT_OUTPUT_DIR,
 
     "runninghub_upload_path": RUNNINGHUB_UPLOAD_PATH,
@@ -356,6 +353,31 @@ def short_json(data, limit=320):
     return short_text(s, limit=limit)
 
 
+def parse_sse_data_json_lines(text):
+    events = []
+
+    for line in str(text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        if not line.startswith("data:"):
+            continue
+
+        raw = line[len("data:"):].strip()
+        if not raw or raw == "[DONE]":
+            continue
+
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                events.append(obj)
+        except Exception:
+            pass
+
+    return events
+
+
 def mask_secret(text, keep_left=6, keep_right=4):
     s = str(text or "")
     if not s:
@@ -490,14 +512,33 @@ def merge_plugin_settings(data=None):
     settings["api_base"] = str(settings.get("api_base", preset.get("api_base", "")) or "").strip().rstrip("/")
     settings["api_key"] = str(settings.get("api_key", "") or "").strip()
     settings["auth_mode"] = str(settings.get("auth_mode", preset.get("auth_mode", "bearer")) or "bearer").strip().lower()
-    settings["submit_path"] = normalize_api_path(settings.get("submit_path"), preset.get("submit_path", SUBMIT_PATH))
-    settings["result_path"] = normalize_api_path(settings.get("result_path"), preset.get("result_path", RESULT_PATH))
+
+    if provider == PROVIDER_GRSAI:
+        settings["submit_path"] = SUBMIT_PATH
+        settings["result_path"] = RESULT_PATH
+        settings["use_data_url_prefix"] = False
+    else:
+        settings["submit_path"] = normalize_api_path(
+            settings.get("submit_path"),
+            preset.get("submit_path", SUBMIT_PATH)
+        )
+        settings["result_path"] = normalize_api_path(
+            settings.get("result_path"),
+            preset.get("result_path", RESULT_PATH)
+        )
+
     default_model = str(settings.get("default_model", DEFAULT_MODEL) or DEFAULT_MODEL).strip()
     if default_model not in ALLOWED_MODELS:
         default_model = DEFAULT_MODEL
     settings["default_model"] = default_model
-    settings["default_image_size"] = str(settings.get("default_image_size", DEFAULT_IMAGE_SIZE) or DEFAULT_IMAGE_SIZE).strip()
-    settings["output_dir"] = str(settings.get("output_dir", DEFAULT_OUTPUT_DIR) or DEFAULT_OUTPUT_DIR).strip()
+
+    settings["default_image_size"] = str(
+        settings.get("default_image_size", DEFAULT_IMAGE_SIZE) or DEFAULT_IMAGE_SIZE
+    ).strip()
+
+    settings["output_dir"] = str(
+        settings.get("output_dir", DEFAULT_OUTPUT_DIR) or DEFAULT_OUTPUT_DIR
+    ).strip()
 
     try:
         settings["poll_interval"] = max(0.2, float(settings.get("poll_interval", DEFAULT_POLL_INTERVAL)))
@@ -509,7 +550,9 @@ def merge_plugin_settings(data=None):
     except Exception:
         settings["poll_timeout"] = DEFAULT_POLL_TIMEOUT
 
-    settings["use_data_url_prefix"] = bool(settings.get("use_data_url_prefix", False))
+    # 注意：GRSAI 上面已经强制 False，这里只处理非 GRSAI
+    if provider != PROVIDER_GRSAI:
+        settings["use_data_url_prefix"] = bool(settings.get("use_data_url_prefix", False))
 
     settings["runninghub_upload_path"] = normalize_api_path(
         settings.get("runninghub_upload_path"),
@@ -551,7 +594,15 @@ def merge_plugin_settings(data=None):
 
 
 def load_plugin_settings():
-    return merge_plugin_settings(read_json(plugin_settings_path(), default={}))
+    raw = read_json(plugin_settings_path(), default={})
+    settings = merge_plugin_settings(raw)
+
+    try:
+        write_json(plugin_settings_path(), settings)
+    except Exception:
+        pass
+
+    return settings
 
 
 def save_plugin_settings(data):
@@ -696,6 +747,45 @@ def http_post_multipart(url, headers=None, fields=None, files=None, timeout=120)
         raise RuntimeError("HTTPError {}: {}".format(e.code, body))
     except urllib.error.URLError as e:
         log_error("HTTP", "MULTIPART POST {} -> URLError {}".format(url, repr(e)))
+        raise RuntimeError("URLError: {}".format(e))
+
+
+def http_get_json(url, headers=None, timeout=120):
+    req_headers = dict(headers or {})
+
+    log_debug("HTTP", "GET {} headers={}".format(
+        url,
+        short_json(sanitize_headers(req_headers), 240)
+    ))
+
+    req = urllib.request.Request(url=url, headers=req_headers, method="GET")
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
+            status_code = resp.getcode()
+            body = resp.read()
+            text = body.decode("utf-8", errors="replace")
+
+            log_debug("HTTP", "GET {} -> status={}".format(url, status_code))
+            if ENABLE_HTTP_DEBUG_BODY:
+                log_debug("HTTP", "GET {} response={}".format(url, short_text(text, 1200)))
+
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+
+            return status_code, text, parsed
+
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        log_error("HTTP", "GET {} -> HTTPError {} body={}".format(
+            url, e.code, short_text(body, 600)
+        ))
+        raise RuntimeError("HTTPError {}: {}".format(e.code, body))
+
+    except urllib.error.URLError as e:
+        log_error("HTTP", "GET {} -> URLError {}".format(url, repr(e)))
         raise RuntimeError("URLError: {}".format(e))
 
 
@@ -1852,6 +1942,7 @@ class NanoBananaClient(object):
         self.poll_timeout = poll_timeout
         self.use_data_url_prefix = use_data_url_prefix
         self.auth_mode = auth_mode
+        self._stream_result_cache = {}
 
     def _headers(self):
         headers = {
@@ -1869,12 +1960,83 @@ class NanoBananaClient(object):
         return headers
 
     def is_gpt_image_model(self, model):
-        return str(model or "").strip().lower() == "gpt-image-2"
+        return str(model or "").strip().lower() in ("gpt-image-2", "gpt-image-2-vip")
 
     def get_submit_path_by_model(self, model):
-        if self.is_gpt_image_model(model):
-            return GPT_IMAGE_SUBMIT_PATH
         return self.submit_path
+
+    def normalize_gpt_image_aspect_ratio_pixels(self, aspect_ratio, image_size="1K", model="gpt-image-2"):
+        ratio = str(aspect_ratio or "").strip().lower()
+        size = str(image_size or "").strip().upper()
+        model = str(model or "").strip().lower()
+
+        if not ratio or ratio == "auto":
+            ratio = "1:1"
+
+        is_vip = model == "gpt-image-2-vip"
+
+        table_1k = {
+            "1:1": "1024x1024",
+            "16:9": "1774x887",
+            "9:16": "887x1774",
+            "3:2": "1536x1024",
+            "2:3": "1024x1536",
+            "21:9": "2048x880",
+            "9:21": "880x2048",
+            "1:3": "688x2048",
+            "3:1": "2048x688",
+            "2:1": "2048x1024",
+            "1:2": "1024x2048",
+            "4:3": "1365x1024",
+            "3:4": "1024x1365",
+            "5:4": "1280x1024",
+            "4:5": "1024x1280",
+        }
+
+        table_2k = {
+            "1:1": "2048x2048",
+            "16:9": "2048x1152",
+            "9:16": "1152x2048",
+            "3:2": "2048x1360",
+            "2:3": "1360x2048",
+            "21:9": "2048x880",
+            "9:21": "880x2048",
+            "1:3": "688x2048",
+            "3:1": "2048x688",
+            "2:1": "2048x1024",
+            "1:2": "1024x2048",
+            "4:3": "2048x1536",
+            "3:4": "1536x2048",
+            "5:4": "2048x1638",
+            "4:5": "1638x2048",
+        }
+
+        table_4k = {
+            "1:1": "2880x2880",
+            "16:9": "3840x2160",
+            "9:16": "2160x3840",
+            "3:2": "3504x2336",
+            "2:3": "2336x3504",
+            "21:9": "3840x1648",
+            "9:21": "1648x3840",
+            "1:3": "1280x3840",
+            "3:1": "3840x1280",
+            "2:1": "3840x1920",
+            "1:2": "1920x3840",
+            "4:3": "3840x2880",
+            "3:4": "2880x3840",
+            "5:4": "3840x3072",
+            "4:5": "3072x3840",
+        }
+
+        if not is_vip:
+            return table_1k.get(ratio, "1024x1024")
+
+        if size == "4K":
+            return table_4k.get(ratio, "2880x2880")
+        if size == "2K":
+            return table_2k.get(ratio, "2048x2048")
+        return table_1k.get(ratio, "1024x1024")
 
     def normalize_aspect_ratio_for_gpt_image(self, aspect_ratio):
         text = str(aspect_ratio or "").strip().lower()
@@ -1981,54 +2143,103 @@ class NanoBananaClient(object):
             raise RuntimeError("已取消")
 
         model = str(model or "").strip()
-        submit_path = self.get_submit_path_by_model(model)
+        url = self.api_base + self.submit_path
+
+        images = list(urls or [])
 
         if self.is_gpt_image_model(model):
             payload = {
                 "model": model,
                 "prompt": prompt,
-                "size": self.normalize_aspect_ratio_for_gpt_image(aspect_ratio),
-                "webHook": "-1",
-                "shutProgress": shut_progress
+                "images": images,
+                "aspectRatio": self.normalize_gpt_image_aspect_ratio_pixels(
+                    aspect_ratio=aspect_ratio,
+                    image_size=image_size,
+                    model=model
+                ),
+                "replyType": "async"
             }
         else:
             payload = {
                 "model": model,
                 "prompt": prompt,
-                "aspectRatio": aspect_ratio,
-                "imageSize": image_size,
-                "webHook": "-1",
-                "shutProgress": shut_progress
+                "images": images,
+                "aspectRatio": str(aspect_ratio or "auto").strip() or "auto",
+                "imageSize": str(image_size or DEFAULT_IMAGE_SIZE).strip().upper(),
+                "replyType": "async"
             }
 
-        if urls:
-            payload["urls"] = urls
-
-        url = self.api_base + submit_path
-
-        log_info("API", "提交任务: provider=grsai model={} images={}".format(model, len(urls or [])))
-        log_debug("API", "GRSAI submit url={} model={} size={} aspect={}".format(
-            url, model, image_size, aspect_ratio
+        log_info("API", "提交任务: provider=grsai model={} images={}".format(model, len(images)))
+        log_debug("API", "GRSAI submit url={} payload={}".format(
+            url,
+            short_json(payload, 500)
         ))
 
-        _, text, data = http_post_json(url=url, headers=self._headers(), payload=payload, timeout=30)
+        _, text, data = http_post_json(
+            url=url,
+            headers=self._headers(),
+            payload=payload,
+            timeout=max(120, int(self.poll_timeout))
+        )
 
         if cancel_cb and cancel_cb():
             raise RuntimeError("已取消")
 
-        if not isinstance(data, dict):
-            raise RuntimeError("提交接口返回不是 JSON: {}".format(text))
+        if isinstance(data, dict):
+            status = str(data.get("status", "") or "").strip().lower()
 
-        if data.get("code") != 0:
-            raise RuntimeError("提交失败: {}".format(text))
+            if status in ("failed", "violation"):
+                raise RuntimeError("提交失败: {}".format(json.dumps(data, ensure_ascii=False)))
 
-        try:
-            task_id = data["data"]["id"]
-        except Exception:
-            raise RuntimeError("提交成功但缺少 data.id: {}".format(text))
+            task_id = str(data.get("id", "") or "").strip()
+            if not task_id:
+                raise RuntimeError("提交成功但缺少 id: {}".format(text))
 
-        log_debug("API", "GRSAI 提交成功: task_id={}".format(task_id))
-        return task_id
+            if status == "succeeded":
+                results = data.get("results", []) or []
+                if results:
+                    image_url = str((results[0] or {}).get("url", "") or "").strip()
+                    if image_url:
+                        self._stream_result_cache[task_id] = image_url
+
+            log_debug("API", "GRSAI 提交成功: task_id={} status={}".format(task_id, status))
+            return task_id
+
+        events = parse_sse_data_json_lines(text)
+        if events:
+            first = events[0] or {}
+            last = events[-1] or {}
+
+            task_id = str(first.get("id") or last.get("id") or "").strip()
+            if not task_id:
+                raise RuntimeError("提交返回 stream，但缺少 id: {}".format(short_text(text, 1000)))
+
+            status = str(last.get("status", "") or "").strip().lower()
+
+            if status in ("failed", "violation"):
+                error = last.get("error", "")
+                failure_reason = last.get("failure_reason", "")
+                raise RuntimeError(
+                    "提交失败: status={}, failure_reason={}, error={}, raw={}".format(
+                        status,
+                        failure_reason,
+                        error,
+                        json.dumps(last, ensure_ascii=False)
+                    )
+                )
+
+            if status == "succeeded":
+                results = last.get("results", []) or []
+                if results:
+                    image_url = str((results[0] or {}).get("url", "") or "").strip()
+                    if image_url:
+                        self._stream_result_cache[task_id] = image_url
+                        log_debug("API", "GRSAI stream 已完成，缓存结果 url: task_id={}".format(task_id))
+
+            log_debug("API", "GRSAI stream 提交成功: task_id={} status={}".format(task_id, status))
+            return task_id
+
+        raise RuntimeError("提交接口返回不是 JSON，也不是可解析的 stream: {}".format(short_text(text, 1200)))
 
     def submit_task_multi(self, image_paths, prompt, model, aspect_ratio, image_size, shut_progress=True,
                           cancel_cb=None):
@@ -2090,12 +2301,21 @@ class NanoBananaClient(object):
         if cancel_cb and cancel_cb():
             raise RuntimeError("已取消")
 
-        url = self.api_base + self.result_path
-        payload = {"id": task_id}
+        from urllib.parse import urlencode
+
+        query = urlencode({
+            "id": task_id
+        })
+
+        url = self.api_base + self.result_path + "?" + query
 
         log_debug("API", "GRSAI query_result task_id={}".format(task_id))
 
-        _, text, data = http_post_json(url=url, headers=self._headers(), payload=payload, timeout=15)
+        _, text, data = http_get_json(
+            url=url,
+            headers=self._headers(),
+            timeout=20
+        )
 
         if cancel_cb and cancel_cb():
             raise RuntimeError("已取消")
@@ -2106,7 +2326,19 @@ class NanoBananaClient(object):
         return data
 
     def poll_result_url(self, task_id, progress_cb=None, cancel_cb=None):
+        cached_url = None
+        try:
+            cached_url = self._stream_result_cache.pop(task_id, None)
+        except Exception:
+            cached_url = None
+
+        if cached_url:
+            if progress_cb:
+                progress_cb("任务已通过 stream 完成")
+            return cached_url
+
         start_time = time.time()
+
         last_resp = None
         transient_error_count = 0
         max_transient_errors = 8
@@ -2133,12 +2365,12 @@ class NanoBananaClient(object):
                 msg = str(e)
 
                 is_transient = (
-                    "UNEXPECTED_EOF_WHILE_READING" in msg or
-                    "SSLEOFError" in msg or
-                    "URLError" in msg or
-                    "timed out" in msg.lower() or
-                    "timeout" in msg.lower() or
-                    "connection reset" in msg.lower()
+                        "UNEXPECTED_EOF_WHILE_READING" in msg or
+                        "SSLEOFError" in msg or
+                        "URLError" in msg or
+                        "timed out" in msg.lower() or
+                        "timeout" in msg.lower() or
+                        "connection reset" in msg.lower()
                 )
 
                 if not is_transient or transient_error_count > max_transient_errors:
@@ -2158,38 +2390,33 @@ class NanoBananaClient(object):
                     wait_left -= step
                 continue
 
-            code = data.get("code")
-            if code == -22:
-                raise RuntimeError("任务不存在: {}".format(task_id))
-            if code != 0:
-                raise RuntimeError("查询失败: {}".format(json.dumps(data, ensure_ascii=False)))
-
-            result = data.get("data", {}) or {}
-            status = str(result.get("status", "")).strip().lower()
-            progress = result.get("progress", 0)
+            status = str(data.get("status", "") or "").strip().lower()
+            progress = data.get("progress", 0)
 
             if progress_cb:
                 progress_cb("任务中... status={} progress={}%".format(status or "unknown", progress))
 
             if status == "succeeded":
-                results = result.get("results", [])
+                results = data.get("results", [])
                 if not results:
-                    raise RuntimeError("任务成功，但 results 为空")
-                image_url = results[0].get("url")
+                    raise RuntimeError("任务成功，但 results 为空: {}".format(
+                        json.dumps(data, ensure_ascii=False)
+                    ))
+
+                first = results[0] or {}
+                image_url = str(first.get("url", "") or "").strip()
                 if not image_url:
-                    raise RuntimeError("任务成功，但 results[0].url 为空")
+                    raise RuntimeError("任务成功，但 results[0].url 为空: {}".format(
+                        json.dumps(data, ensure_ascii=False)
+                    ))
+
                 return image_url
 
-            if status == "failed":
-                failure_reason = result.get("failure_reason", "")
-                error = result.get("error", "")
-
-                if progress_cb:
-                    progress_cb("任务失败: failure_reason={}, error={}".format(failure_reason, error))
-
+            if status in ("failed", "violation"):
+                error = data.get("error", "")
                 raise RuntimeError(
-                    "生成失败: failure_reason={}, error={}, raw={}".format(
-                        failure_reason,
+                    "生成失败: status={}, error={}, raw={}".format(
+                        status,
                         error,
                         json.dumps(data, ensure_ascii=False)
                     )
@@ -3373,35 +3600,32 @@ class AIGenPanel(QtWidgets.QWidget):
 
     def update_size_combo_state(self):
         model = self.model_combo.currentText().strip().lower()
-        is_gpt_image = (model == "gpt-image-2")
 
         self.size_combo.blockSignals(True)
         try:
-            if is_gpt_image:
+            for v in ["1K", "2K", "4K"]:
+                if self.size_combo.findText(v) < 0:
+                    self.size_combo.addItem(v)
+
+            current_size = str(
+                self.settings_data.get("default_image_size", DEFAULT_IMAGE_SIZE) or DEFAULT_IMAGE_SIZE
+            ).strip().upper()
+
+            if current_size not in ("1K", "2K", "4K"):
+                current_size = DEFAULT_IMAGE_SIZE
+
+            if model == "gpt-image-2":
                 self.size_combo.setEnabled(False)
+                self.size_combo.setCurrentText("1K")
 
-                if self.size_combo.findText("默认") < 0:
-                    self.size_combo.addItem("默认")
-
-                self.size_combo.setCurrentText("默认")
-            else:
-                if self.size_combo.findText("1K") < 0:
-                    self.size_combo.addItem("1K")
-                if self.size_combo.findText("2K") < 0:
-                    self.size_combo.addItem("2K")
-                if self.size_combo.findText("4K") < 0:
-                    self.size_combo.addItem("4K")
-
+            elif model == "gpt-image-2-vip":
                 self.size_combo.setEnabled(True)
+                self.size_combo.setCurrentText(current_size if current_size in ("1K", "2K", "4K") else "2K")
 
-                current_size = str(
-                    self.settings_data.get("default_image_size", DEFAULT_IMAGE_SIZE) or DEFAULT_IMAGE_SIZE
-                ).strip().upper()
-
-                if current_size not in ("1K", "2K", "4K"):
-                    current_size = DEFAULT_IMAGE_SIZE
-
+            else:
+                self.size_combo.setEnabled(True)
                 self.size_combo.setCurrentText(current_size)
+
         finally:
             self.size_combo.blockSignals(False)
 
@@ -3460,10 +3684,12 @@ class AIGenPanel(QtWidgets.QWidget):
 
         self.model_combo = QtWidgets.QComboBox()
         self.model_combo.addItems([
-            "gpt-image-2",
             "nano-banana-2",
             "nano-banana-pro",
+            "gpt-image-2",
+            "gpt-image-2-vip",
         ])
+
         self.model_combo.setCurrentText(DEFAULT_MODEL)
         self.model_combo.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
@@ -5769,15 +5995,19 @@ class AIGenPanel(QtWidgets.QWidget):
         model = str(model or "").strip().lower()
         image_size = str(image_size or "").strip().upper()
 
-        if model in ("nano-banana-pro", "nano-banana-2"):
-            if image_size in ("1K", "2K", "4K"):
-                return image_size
-            return "2K"
+        if image_size not in ("1K", "2K", "4K"):
+            image_size = DEFAULT_IMAGE_SIZE
 
         if model == "gpt-image-2":
+            return "1K"
+
+        if model == "gpt-image-2-vip":
             return image_size
 
-        return image_size
+        if model in ("nano-banana-2", "nano-banana-pro"):
+            return image_size
+
+        return DEFAULT_IMAGE_SIZE
 
     def start_background_generate(self, capture_path=None, input_image_paths=None, camera_state=None, ctx=None,
                                   prompt_override=None, aspect_ratio_override=None):
