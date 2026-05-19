@@ -2121,7 +2121,7 @@ class NanoBananaClient(object):
     def get_upload_max_side(self, image_path=None):
         return 1536
 
-    def image_file_to_base64(self, image_path):
+    def image_file_to_base64(self, image_path, force_data_url_prefix=None):
         max_side = self.get_upload_max_side(image_path)
         data, mime = self.prepare_upload_image_bytes_and_mime(image_path, max_side=max_side)
         b64 = base64.b64encode(data).decode("utf-8")
@@ -2133,8 +2133,14 @@ class NanoBananaClient(object):
             max_side
         ))
 
-        if self.use_data_url_prefix:
+        if force_data_url_prefix is None:
+            use_prefix = self.use_data_url_prefix
+        else:
+            use_prefix = bool(force_data_url_prefix)
+
+        if use_prefix:
             return "data:{};base64,{}".format(mime, b64)
+
         return b64
 
     def submit_task_common(self, prompt, model, aspect_ratio, image_size, urls=None, shut_progress=True,
@@ -2245,10 +2251,15 @@ class NanoBananaClient(object):
                           cancel_cb=None):
         urls = []
 
+        force_data_url = self.is_gpt_image_model(model)
+
         for image_path in (image_paths or []):
             if cancel_cb and cancel_cb():
                 raise RuntimeError("已取消")
-            urls.append(self.image_file_to_base64(image_path))
+            urls.append(self.image_file_to_base64(
+                image_path,
+                force_data_url_prefix=force_data_url
+            ))
 
         return self.submit_task_common(
             prompt=prompt,
@@ -2286,7 +2297,11 @@ class NanoBananaClient(object):
         return self.download_image(image_url, cancel_cb=cancel_cb)
 
     def submit_task(self, image_path, prompt, model, aspect_ratio, image_size, shut_progress=True, cancel_cb=None):
-        image_b64 = self.image_file_to_base64(image_path)
+        image_b64 = self.image_file_to_base64(
+            image_path,
+            force_data_url_prefix=self.is_gpt_image_model(model)
+        )
+
         return self.submit_task_common(
             prompt=prompt,
             model=model,
