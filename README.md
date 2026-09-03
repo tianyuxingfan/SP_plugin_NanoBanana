@@ -6,9 +6,11 @@ API 接口：https://www.runninghub.cn/
 
 API eky 在设置界面填写即可
 
-插件放置位置，将AI_View_To_Paint文件放到这个路径中：C:\Users\用户名\Documents\Adobe\Adobe Substance 3D Painter\python\plugins
+插件放置位置，将整个文件夹放到这个路径中：C:\Users\用户名\Documents\Adobe\Adobe Substance 3D Painter\python\plugins
  
 可在此处查看视频（版本更新后界面有所不同）：https://www.bilibili.com/video/BV16YSDBiEnf/?spm_id_from=333.337.search-card.all.click&vd_source=5d4e2a4b952ec90f0469ef3efc7ea384
+
+1.04版本更新 ：单文件重构为多文件，旧数据不兼容，多视图改完单张逐个生成提升分辨率。
 
 1.03版本更新 ：单视角增加参考图勾选框，选中参考图文件后截图，可根据参考图风格生成。
 
